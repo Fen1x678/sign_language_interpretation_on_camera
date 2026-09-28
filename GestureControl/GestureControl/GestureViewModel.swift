@@ -15,6 +15,29 @@ enum RecordingState: Equatable {
     case recording(Double)   // прогресс 0…1
 }
 
+/// Режим подсветки.
+enum LightMode: String, CaseIterable, Identifiable {
+    case auto, on, off
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .auto: return "Авто"
+        case .on:   return "Всегда вкл."
+        case .off:  return "Выключена"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .auto: return "wand.and.stars"
+        case .on:   return "flashlight.on.fill"
+        case .off:  return "flashlight.off.fill"
+        }
+    }
+}
+
 /// Связывает камеру, распознавание и интерфейс.
 /// Блоки схемы «Определение команды → Выполнение действия → Отображение результата».
 @MainActor
@@ -45,19 +68,37 @@ final class GestureViewModel: ObservableObject {
         didSet { if !isRecognitionEnabled { resetRecognition() } }
     }
 
+    // MARK: Подсветка
+    @Published var lightMode: LightMode = .auto {
+        didSet { applyLightMode() }
+    }
+    /// Подсветка включена (фонарик у задней камеры или экран у фронтальной).
+    @Published private(set) var isLightOn = false
+    /// Подсветка экраном (для фронтальной камеры — у неё нет фонарика).
+    @Published private(set) var isScreenLightOn = false
+    private var sceneBrightness: Double?
+    private var darkSince: Double?
+    private var brightSince: Double?
+    private var lightChangedAt: Double = 0
+    private var brightnessWithLight: Double?
+    private var lastAutoOffAt: Double = -100
+    private var offMargin: Double = 2.0
+    private var savedScreenBrightness: CGFloat?
+    /// Ниже этой яркости (шкала APEX) сцена считается тёмной.
+    private let darkLevel: Double = -1.0
+
     // MARK: Словарь жестов и обучение
     let library = SignLibrary()
     @Published private(set) var recording: RecordingState = .idle
     @Published private(set) var recordingWord = ""
     @Published private(set) var recordingDynamic = false
-    private var recordedSamples: [[Float]] = []
-    private var recordedFrames: [[Float]] = []
+    private var recordedFrames: [SignFrame] = []
     private var recordingStart: Double = 0
     private var recordingDuration: Double { recordingDynamic ? 2.5 : 2.0 }
 
-    // MARK: Жесты с движением
-    private var motionBuffer: [(time: Double, frame: [Float])] = []
-    private var previousMainCenter: CGPoint?
+    // MARK: Движение рук
+    private var motionBuffer: [(time: Double, features: FrameFeatures)] = []
+    private var previousMain: (center: CGPoint, time: Double)?
     private var lastHandSeenTime: Double = 0
     private var frameCounter = 0
     private var motionCooldownUntil: Double = 0
@@ -123,21 +164,38 @@ final class GestureViewModel: ObservableObject {
         cameraPosition = camera.position
         camera.startRunning()
 
-        for await points in camera.frames {
-            process(points)
+        for await frame in camera.frames {
+            process(frame)
         }
     }
 
     /// Фронтальная ↔ задняя камера.
     func switchCamera() {
+        let wasLightOn = isLightOn
+        setLight(false)
         do {
             try camera.switchCamera()
             cameraPosition = camera.position
             handPoints = []
+            previousMain = nil
+            sceneBrightness = nil
             resetRecognition()
+            if wasLightOn { setLight(true) }
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         } catch {
             cameraError = error.localizedDescription
+        }
+    }
+
+    /// Приложение свёрнуто или снова открыто.
+    func scenePhaseChanged(_ phase: ScenePhase) {
+        switch phase {
+        case .active:
+            if lightMode == .on { setLight(true) }
+        case .background:
+            setLight(false)
+        default:
+            break
         }
     }
 
@@ -157,7 +215,7 @@ final class GestureViewModel: ObservableObject {
 
     // MARK: Обработка кадра
 
-    private func process(_ raw: [[CGPoint]]) {
+    private func process(_ frame: CameraFrame) {
         let now = CACurrentMediaTime()
         if lastFrameTime > 0 {
             let dt = now - lastFrameTime
@@ -167,11 +225,13 @@ final class GestureViewModel: ObservableObject {
         }
         lastFrameTime = now
 
+        updateLight(brightness: frame.brightness, now: now)
+
         // Координаты камеры → координаты экрана (учитывает поворот и зеркалирование фронтальной камеры).
         var screenHands: [[CGPoint]] = []
         var handsForRecognition: [[CGPoint]] = []
-        if !raw.isEmpty, let layer = previewLayer {
-            screenHands = raw.map { hand in
+        if !frame.hands.isEmpty, let layer = previewLayer {
+            screenHands = frame.hands.map { hand in
                 hand.map { point in
                     point.x < 0 ? CGPoint(x: -1, y: -1) : layer.layerPointConverted(fromCaptureDevicePoint: point)
                 }
@@ -192,17 +252,17 @@ final class GestureViewModel: ObservableObject {
 
         let geometries = handsForRecognition.compactMap { HandGeometry(points: $0) }
         if !geometries.isEmpty { lastHandSeenTime = now }
-        let motionFrame = makeMotionFrame(geometries)
+        let velocity = trackVelocity(geometries, now: now)
+        let poseFrame = SignFrame.make(from: geometries)
+        let motionFrame = velocity.flatMap { SignFrame.make(from: geometries, velocity: $0) }
 
         // Запись нового жеста.
         switch recording {
         case .countdown:
             return
         case .recording:
-            if recordingDynamic {
-                if let motionFrame { recordedFrames.append(motionFrame) }
-            } else if let vector = HandFeatures.signVector(from: geometries) {
-                recordedSamples.append(vector)
+            if let f = recordingDynamic ? motionFrame : poseFrame {
+                recordedFrames.append(f)
             }
             let elapsed = now - recordingStart
             if elapsed >= recordingDuration {
@@ -226,36 +286,38 @@ final class GestureViewModel: ObservableObject {
             if recognizeMotion(frame: motionFrame, now: now) { return }
         }
 
+        let poseFeatures = poseFrame.map(FrameFeatures.init)
         let result = recognizer.process(hands: handsForRecognition, time: now) { hands in
-            self.classifyStatic(hands)
+            self.classifyStatic(hands, features: poseFeatures)
         }
         apply(result)
     }
 
-    /// Кадр для жестов с движением: поза рук + смещение ведущей руки.
-    private func makeMotionFrame(_ hands: [HandGeometry]) -> [Float]? {
-        guard let main = hands.max(by: { $0.size < $1.size }) else {
-            previousMainCenter = nil
+    /// Скорость ведущей руки. Ведущая — та, что ближе к прошлому положению (чтобы не «прыгать» между руками).
+    private func trackVelocity(_ hands: [HandGeometry], now: Double) -> CGVector? {
+        guard !hands.isEmpty else {
+            previousMain = nil
             return nil
         }
-        defer { previousMainCenter = main.center }
-        guard let shape = HandFeatures.signVector(from: hands) else { return nil }
-        var dx: CGFloat = 0
-        var dy: CGFloat = 0
-        if let previous = previousMainCenter {
-            dx = (main.center.x - previous.x) / main.size
-            dy = (main.center.y - previous.y) / main.size
+        let main: HandGeometry
+        if let previous = previousMain {
+            main = hands.min { dist($0.center, previous.center) < dist($1.center, previous.center) }!
+        } else {
+            main = hands.max { $0.size < $1.size }!
         }
-        return MotionFeatures.frame(shape: shape, dx: dx, dy: dy)
+        defer { previousMain = (center: main.center, time: now) }
+
+        guard let previous = previousMain, now - previous.time < 0.3 else { return .zero }
+        return SignMatching.velocity(from: previous.center, to: main.center, size: main.size, dt: now - previous.time)
     }
 
     /// Возвращает true, если распознан жест с движением.
-    private func recognizeMotion(frame: [Float]?, now: Double) -> Bool {
+    private func recognizeMotion(frame: SignFrame?, now: Double) -> Bool {
         guard library.hasDynamicSigns else { return false }
 
         if now - lastHandSeenTime > 0.5 { motionBuffer.removeAll() }
         if let frame, now >= motionCooldownUntil {
-            motionBuffer.append((time: now, frame: frame))
+            motionBuffer.append((time: now, features: FrameFeatures(frame)))
         }
         let window = motionWindow
         motionBuffer.removeAll { now - $0.time > window }
@@ -264,7 +326,7 @@ final class GestureViewModel: ObservableObject {
         guard frameCounter % 3 == 0, motionBuffer.count >= 10 else { return false }
 
         // Берём каждый второй кадр — так же, как при подготовке записанного жеста.
-        let stream = stride(from: motionBuffer.count % 2, to: motionBuffer.count, by: 2).map { motionBuffer[$0].frame }
+        let stream = stride(from: motionBuffer.count % 2, to: motionBuffer.count, by: 2).map { motionBuffer[$0].features }
         guard let sign = library.classifyMotion(stream) else { return false }
 
         motionBuffer.removeAll()
@@ -278,24 +340,20 @@ final class GestureViewModel: ObservableObject {
     }
 
     /// Статичный жест.
-    /// «Перевод»: только жесты из словаря пользователя (сначала двумя руками, потом одной).
+    /// «Перевод»: только жесты из словаря пользователя.
     /// «Управление»: встроенные жесты.
-    private func classifyStatic(_ hands: [HandGeometry]) -> Sign {
-        guard let main = hands.max(by: { $0.size < $1.size }) else { return .none }
-
+    private func classifyStatic(_ hands: [HandGeometry], features: FrameFeatures?) -> Sign {
         switch mode {
         case .translate:
-            if hands.count >= 2,
-               let vector = HandFeatures.signVector(from: hands),
-               let sign = library.classifyPose(vector) {
-                return .custom(id: sign.id, word: sign.word)
-            }
-            if let vector = HandFeatures.handVector(from: main),
-               let sign = library.classifyPose(vector) {
+            guard let features else { return .none }
+            var sticky: UUID?
+            if case .custom(let id, _) = currentSign { sticky = id }
+            if let sign = library.classifyPose(features, sticky: sticky) {
                 return .custom(id: sign.id, word: sign.word)
             }
             return .none
         case .control:
+            guard let main = hands.max(by: { $0.size < $1.size }) else { return .none }
             let gesture = main.staticGesture()
             return gesture == .idle ? .none : .builtIn(gesture)
         }
@@ -316,6 +374,100 @@ final class GestureViewModel: ObservableObject {
         }
     }
 
+    // MARK: Автоматическая подсветка
+
+    private func applyLightMode() {
+        switch lightMode {
+        case .on:
+            setLight(true)
+        case .off:
+            setLight(false)
+        case .auto:
+            darkSince = nil
+            brightSince = nil
+            offMargin = 2.0
+            if let b = sceneBrightness, b >= darkLevel { setLight(false) }
+        }
+    }
+
+    /// Включает подсветку в темноте и выключает, когда стало светло.
+    /// Когда подсветка включена, камера видит сцену светлее. Поэтому выключаем её,
+    /// только если стало заметно светлее, чем было с подсветкой (включили свет в комнате).
+    private func updateLight(brightness: Double, now: Double) {
+        guard brightness.isFinite else { return }
+        let smoothed = sceneBrightness.map { $0 * 0.9 + brightness * 0.1 } ?? brightness
+        sceneBrightness = smoothed
+
+        guard lightMode == .auto, recording == .idle, now - lightChangedAt > 2 else { return }
+
+        if !isLightOn {
+            brightSince = nil
+            if smoothed < darkLevel {
+                if darkSince == nil { darkSince = now }
+                if let since = darkSince, now - since > 1.0 {
+                    // Если только что выключили, а снова темно — выключать в следующий раз осторожнее.
+                    if now - lastAutoOffAt < 6 { offMargin = min(4, offMargin + 1) }
+                    setLight(true)
+                }
+            } else {
+                darkSince = nil
+            }
+        } else {
+            darkSince = nil
+            if brightnessWithLight == nil {
+                brightnessWithLight = smoothed
+                return
+            }
+            let offLevel = max(darkLevel + 2.5, (brightnessWithLight ?? smoothed) + offMargin)
+            if smoothed > offLevel {
+                if brightSince == nil { brightSince = now }
+                if let since = brightSince, now - since > 1.5 {
+                    lastAutoOffAt = now
+                    setLight(false)
+                }
+            } else {
+                brightSince = nil
+            }
+        }
+    }
+
+    private func setLight(_ on: Bool) {
+        lightChangedAt = CACurrentMediaTime()
+        brightnessWithLight = nil
+        darkSince = nil
+        brightSince = nil
+
+        if on {
+            if cameraPosition == .back, camera.hasTorch {
+                camera.setTorch(true)
+                setScreenLight(false)
+            } else {
+                setScreenLight(true)   // у фронтальной камеры фонарика нет — светим экраном
+            }
+        } else {
+            camera.setTorch(false)
+            setScreenLight(false)
+        }
+        if isLightOn != on { isLightOn = on }
+    }
+
+    private var screen: UIScreen? {
+        UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.screen }.first
+    }
+
+    private func setScreenLight(_ on: Bool) {
+        guard isScreenLightOn != on else { return }
+        isScreenLightOn = on
+        guard let screen else { return }
+        if on {
+            savedScreenBrightness = screen.brightness
+            screen.brightness = 1.0
+        } else if let saved = savedScreenBrightness {
+            screen.brightness = saved
+            savedScreenBrightness = nil
+        }
+    }
+
     // MARK: Обучение новому жесту
 
     func startRecording(word: String, dynamic: Bool) {
@@ -323,7 +475,6 @@ final class GestureViewModel: ObservableObject {
         guard !cleaned.isEmpty, recording == .idle else { return }
         recordingWord = cleaned
         recordingDynamic = dynamic
-        recordedSamples = []
         recordedFrames = []
         if mode != .translate { mode = .translate }
 
@@ -341,29 +492,27 @@ final class GestureViewModel: ObservableObject {
         recording = .idle
         resetRecognition()
 
+        // Оставляем кадры с тем числом рук, которое было видно чаще всего.
+        let groups = Dictionary(grouping: recordedFrames, by: { $0.handCount })
+        let handCount = groups.max { $0.value.count < $1.value.count }?.key ?? 1
+        let frames = recordedFrames.filter { $0.handCount == handCount }
+
         if recordingDynamic {
-            // Оставляем кадры с тем числом рук, которое было видно чаще всего.
-            let groups = Dictionary(grouping: recordedFrames, by: { $0.count })
-            let length = groups.max { $0.value.count < $1.value.count }?.key
-            let frames = recordedFrames.filter { $0.count == length }
-            let template = MotionFeatures.prepareTemplate(frames)
+            let template = SignMatching.prepareTemplate(frames)
             if frames.count >= 15 && template.count >= 5 {
-                library.addSequence(word: recordingWord, sequence: template)
-                savedNotice(handCount: (length ?? 0) > MotionFeatures.oneHandFrameLength ? 2 : 1)
+                library.addMotion(word: recordingWord, frames: template)
+                savedNotice(handCount: handCount)
             } else {
                 failedNotice()
             }
         } else {
-            let groups = Dictionary(grouping: recordedSamples, by: { $0.count })
-            let samples = groups.max { $0.value.count < $1.value.count }?.value ?? []
-            if samples.count >= 8 {
-                library.add(word: recordingWord, samples: samples)
-                savedNotice(handCount: samples[0].count > HandFeatures.oneHandLength ? 2 : 1)
+            if frames.count >= 8 {
+                library.addPoses(word: recordingWord, frames: frames)
+                savedNotice(handCount: handCount)
             } else {
                 failedNotice()
             }
         }
-        recordedSamples = []
         recordedFrames = []
     }
 

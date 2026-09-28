@@ -8,6 +8,7 @@ struct ContentView: View {
     @StateObject private var vm = GestureViewModel()
     @State private var showHelp = false
     @State private var showLibrary = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ZStack {
@@ -21,6 +22,14 @@ struct ContentView: View {
             HandOverlay(hands: vm.handPoints, isActive: vm.currentSign != .none)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
+
+            // Подсветка экраном для фронтальной камеры: белая рамка на максимальной яркости.
+            if vm.isScreenLightOn {
+                Rectangle()
+                    .strokeBorder(Color.white, lineWidth: 44)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+            }
 
             VStack(spacing: 10) {
                 topBar
@@ -56,6 +65,9 @@ struct ContentView: View {
         .animation(.snappy, value: vm.notice)
         .preferredColorScheme(.dark)
         .task { await vm.start() }
+        .onChange(of: scenePhase) { _, phase in
+            vm.scenePhaseChanged(phase)
+        }
         .sheet(isPresented: $showHelp) { GestureHelpView() }
         .sheet(isPresented: $showLibrary) {
             SignLibraryView(library: vm.library) { word, dynamic in
@@ -113,6 +125,7 @@ struct ContentView: View {
 
             Spacer()
 
+            lightMenu
             circleButton("arrow.triangle.2.circlepath.camera") { vm.switchCamera() }
             circleButton(vm.isRecognitionEnabled ? "eye.fill" : "eye.slash.fill") {
                 vm.isRecognitionEnabled.toggle()
@@ -120,6 +133,32 @@ struct ContentView: View {
             circleButton("questionmark") { showHelp = true }
         }
         .foregroundStyle(.white)
+    }
+
+    /// Подсветка: авто / всегда / выключена. Жёлтый кружок — подсветка сейчас горит, буква A — авторежим.
+    private var lightMenu: some View {
+        Menu {
+            Picker("Подсветка", selection: $vm.lightMode) {
+                ForEach(LightMode.allCases) { mode in
+                    Label(mode.title, systemImage: mode.icon).tag(mode)
+                }
+            }
+        } label: {
+            ZStack(alignment: .bottomTrailing) {
+                Image(systemName: vm.isLightOn ? "flashlight.on.fill" : "flashlight.off.fill")
+                    .foregroundStyle(vm.isLightOn ? Color.black : Color.white)
+                    .frame(width: 38, height: 38)
+                    .background(vm.isLightOn ? AnyShapeStyle(Color.yellow) : AnyShapeStyle(Material.ultraThinMaterial),
+                                in: Circle())
+                if vm.lightMode == .auto {
+                    Text("A")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 15, height: 15)
+                        .background(Color.blue, in: Circle())
+                }
+            }
+        }
     }
 
     private var modeBar: some View {
@@ -361,6 +400,13 @@ struct GestureHelpView: View {
                     Text("Каждое слово лучше записать 2–3 раза: с разных камер, при разном свете. Чем больше примеров, тем точнее перевод.")
                     Text("Задняя камера: наведите телефон на собеседника — перевод на экране и голосом. Фронтальная: жестикулирующий сам видит, правильно ли переведено.")
                     Text("Опустите руки на 2 секунды — фраза закончится и уйдёт в историю.")
+                    Text("Разные люди: приложение сравнивает углы сгиба пальцев, а не их длину, и понимает левую руку как зеркало правой. Для лучшей точности запишите одно слово у 2–3 разных людей.")
+                }
+                .font(.footnote)
+
+                Section("Подсветка") {
+                    Text("Кнопка с фонариком вверху: «Авто» — включается сама, когда темно, и выключается, когда стало светло; «Всегда вкл.» или «Выключена».")
+                    Text("У задней камеры светит фонарик. У фронтальной фонарика нет — светит экран: яркость на максимум и белая рамка вокруг изображения.")
                 }
                 .font(.footnote)
 
@@ -448,7 +494,7 @@ struct SignLibraryView: View {
                                     .foregroundStyle(.secondary)
                             }
                             Spacer()
-                            Text("примеров: \(sign.exampleCount)")
+                            Text("записей: \(sign.exampleCount)")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -459,7 +505,27 @@ struct SignLibraryView: View {
                 } header: {
                     Text("Словарь: \(library.signs.count)")
                 } footer: {
-                    Text("Чтобы жест узнавался надёжнее, запишите то же слово ещё 1–2 раза — примеры добавятся. Удалить слово — свайп влево по строке.")
+                    Text("Чтобы жест понимали у всех, запишите одно и то же слово у 2–3 разных людей — записи добавятся к слову. Удалить слово — свайп влево по строке.")
+                }
+
+                Section {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Slider(value: $library.sensitivity, in: 0.6...1.6, step: 0.1)
+                        HStack {
+                            Text("Строже")
+                            Spacer()
+                            Text("\(Int((library.sensitivity * 100).rounded())) %")
+                                .monospacedDigit()
+                            Spacer()
+                            Text("Мягче")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Чувствительность")
+                } footer: {
+                    Text("Если жесты часто не распознаются — сдвиньте вправо. Если появляются лишние слова — влево.")
                 }
             }
             .navigationTitle("Словарь жестов")

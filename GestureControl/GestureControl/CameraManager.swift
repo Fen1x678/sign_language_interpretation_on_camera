@@ -1,5 +1,6 @@
 import AVFoundation
 import Vision
+import ImageIO
 
 enum CameraError: LocalizedError {
     case noCamera
@@ -15,22 +16,29 @@ enum CameraError: LocalizedError {
     }
 }
 
+/// Кадр, обработанный камерой:
+/// • hands — найденные руки (до двух), у каждой 21 точка в координатах камеры (0…1, начало — левый верхний угол),
+///   точка (-1, -1) — не найдена;
+/// • brightness — яркость сцены по данным камеры (EXIF BrightnessValue, шкала APEX):
+///   примерно −3 и ниже — темно, 0 — полумрак, 2…5 — комната со светом, 7+ — улица днём.
+///   NaN — камера не сообщила яркость.
+typealias CameraFrame = (hands: [[CGPoint]], brightness: Double)
+
 /// Блоки структурной схемы: «Камера → Получение видеокадров → Обнаружение руки → Определение ключевых точек».
-///
-/// Каждый кадр обрабатывается на фоновой очереди запросом Apple Vision
-/// `VNDetectHumanHandPoseRequest`, который находит руку и 21 ключевую точку кисти.
-/// Для каждой найденной руки (до двух) наружу отдаётся массив из 21 точки
-/// в координатах камеры (0…1, начало — левый верхний угол).
-/// Точка (-1, -1) означает, что эта точка не найдена или найдена неуверенно.
-/// Пустой массив — рук в кадре нет.
 final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
-    let frames: AsyncStream<[[CGPoint]]>
+    let frames: AsyncStream<CameraFrame>
 
     /// Какая камера сейчас используется.
     private(set) var position: AVCaptureDevice.Position = .front
 
-    private let continuation: AsyncStream<[[CGPoint]]>.Continuation
+    /// Есть ли фонарик у текущей камеры (у фронтальной его нет).
+    var hasTorch: Bool {
+        guard let device = currentInput?.device else { return false }
+        return device.hasTorch && device.isTorchAvailable
+    }
+
+    private let continuation: AsyncStream<CameraFrame>.Continuation
     private let videoOutput = AVCaptureVideoDataOutput()
     private let videoQueue = DispatchQueue(label: "gesture.camera.video", qos: .userInteractive)
     private var currentInput: AVCaptureDeviceInput?
@@ -38,7 +46,7 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     override init() {
         // Храним только самый свежий кадр: если обработка не успевает, старые кадры отбрасываются.
-        let (stream, continuation) = AsyncStream.makeStream(of: [[CGPoint]].self,
+        let (stream, continuation) = AsyncStream.makeStream(of: CameraFrame.self,
                                                             bufferingPolicy: .bufferingNewest(1))
         self.frames = stream
         self.continuation = continuation
@@ -74,6 +82,7 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     /// Переключение между фронтальной и задней камерой.
     func switchCamera() throws {
         guard isConfigured else { return }
+        setTorch(false)
         let newPosition: AVCaptureDevice.Position = position == .front ? .back : .front
         let newInput = try makeInput(for: newPosition)
 
@@ -94,7 +103,39 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position) else {
             throw CameraError.noCamera
         }
+        improveLowLight(device)
         return try AVCaptureDeviceInput(device: device)
+    }
+
+    /// В темноте камера сама поднимает чувствительность (если модель iPhone это умеет).
+    private func improveLowLight(_ device: AVCaptureDevice) {
+        guard device.isLowLightBoostSupported else { return }
+        do {
+            try device.lockForConfiguration()
+            device.automaticallyEnablesLowLightBoostWhenAvailable = true
+            device.unlockForConfiguration()
+        } catch {
+            // Не критично: работаем без усиления.
+        }
+    }
+
+    /// Включает или выключает фонарик задней камеры.
+    func setTorch(_ on: Bool) {
+        guard let device = currentInput?.device, device.hasTorch else { return }
+        do {
+            try device.lockForConfiguration()
+            if on {
+                if device.isTorchAvailable {
+                    // Не на полную мощность: ярко, но телефон меньше греется.
+                    try device.setTorchModeOn(level: min(0.8, AVCaptureDevice.maxAvailableTorchLevel))
+                }
+            } else if device.torchMode != .off {
+                device.torchMode = .off
+            }
+            device.unlockForConfiguration()
+        } catch {
+            // Фонарик занят или недоступен (например, телефон перегрелся).
+        }
     }
 
     func startRunning() {
@@ -116,6 +157,13 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     nonisolated func captureOutput(_ output: AVCaptureOutput,
                                    didOutput sampleBuffer: CMSampleBuffer,
                                    from connection: AVCaptureConnection) {
+        // Яркость сцены из метаданных кадра.
+        var brightness = Double.nan
+        if let exif = CMGetAttachment(sampleBuffer, key: kCGImagePropertyExifDictionary, attachmentModeOut: nil) as? [String: Any],
+           let value = exif[kCGImagePropertyExifBrightnessValue as String] as? Double {
+            brightness = value
+        }
+
         let request = VNDetectHumanHandPoseRequest()
         request.maximumHandCount = 2
 
@@ -123,7 +171,7 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         do {
             try handler.perform([request])
             guard let observations = request.results, !observations.isEmpty else {
-                continuation.yield([])   // рук нет в кадре
+                continuation.yield((hands: [], brightness: brightness))   // рук нет в кадре
                 return
             }
 
@@ -149,9 +197,9 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 }
                 hands.append(points)
             }
-            continuation.yield(hands)
+            continuation.yield((hands: hands, brightness: brightness))
         } catch {
-            continuation.yield([])
+            continuation.yield((hands: [], brightness: brightness))
         }
     }
 }
