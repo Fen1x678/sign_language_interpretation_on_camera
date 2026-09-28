@@ -70,8 +70,8 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showHelp) { GestureHelpView() }
         .sheet(isPresented: $showLibrary) {
-            SignLibraryView(library: vm.library) { word, dynamic in
-                vm.startRecording(word: word, dynamic: dynamic)
+            SignLibraryView(library: vm.library) { word, dynamic, multiAngle in
+                vm.startRecording(word: word, dynamic: dynamic, multiAngle: multiAngle)
             }
         }
     }
@@ -82,8 +82,14 @@ struct ContentView: View {
         VStack(spacing: 14) {
             switch vm.recording {
             case .countdown(let n):
-                Text("Приготовьтесь показать жест")
+                if vm.recordingSteps > 1 {
+                    Text("Ракурс \(vm.recordingStep) из \(vm.recordingSteps)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                Text(vm.recordingPrompt)
                     .font(.headline)
+                    .multilineTextAlignment(.center)
                 Text("\(n)")
                     .font(.system(size: 72, weight: .bold, design: .rounded))
                     .contentTransition(.numericText())
@@ -401,6 +407,7 @@ struct GestureHelpView: View {
                     Text("Задняя камера: наведите телефон на собеседника — перевод на экране и голосом. Фронтальная: жестикулирующий сам видит, правильно ли переведено.")
                     Text("Опустите руки на 2 секунды — фраза закончится и уйдёт в историю.")
                     Text("Разные люди: приложение сравнивает углы сгиба пальцев, а не их длину, и понимает левую руку как зеркало правой. Для лучшей точности запишите одно слово у 2–3 разных людей.")
+                    Text("Разные ракурсы: записывайте жесты «С трёх ракурсов». Кроме того, приложение само достраивает, как жест выглядит сбоку, сверху и снизу. Если палец скрыт при повороте, он учитывается слабее, а не ломает распознавание.")
                 }
                 .font(.footnote)
 
@@ -440,11 +447,12 @@ struct GestureHelpView: View {
 
 struct SignLibraryView: View {
     @ObservedObject var library: SignLibrary
-    let onRecord: (String, Bool) -> Void
+    let onRecord: (String, Bool, Bool) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var newWord = ""
     @State private var isDynamic = true
+    @State private var multiAngle = true
 
     private var canRecord: Bool {
         !newWord.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -462,11 +470,12 @@ struct SignLibraryView: View {
                         Text("Поза").tag(false)
                     }
                     .pickerStyle(.segmented)
+                    Toggle("С трёх ракурсов (рекомендуется)", isOn: $multiAngle)
                     Button {
                         let word = newWord
                         newWord = ""
                         dismiss()
-                        onRecord(word, isDynamic)
+                        onRecord(word, isDynamic, multiAngle)
                     } label: {
                         Label("Записать жест", systemImage: "record.circle")
                     }
@@ -474,9 +483,12 @@ struct SignLibraryView: View {
                 } header: {
                     Text("Научить новому жесту")
                 } footer: {
-                    Text(isDynamic
-                         ? "После отсчёта 3-2-1 покажите жест целиком за 2,5 секунды, как обычно при разговоре. Можно одной или двумя руками."
-                         : "После отсчёта 3-2-1 держите позу 2 секунды. Можно одной или двумя руками.")
+                    Text((isDynamic
+                          ? "После отсчёта покажите жест целиком за 2,5 секунды, как обычно при разговоре. "
+                          : "После отсчёта держите позу 2 секунды. ")
+                         + (multiAngle
+                            ? "Запись пройдёт 3 раза: прямо, чуть левее и чуть правее — так жест будет узнаваться и под углом."
+                            : "Можно одной или двумя руками."))
                 }
 
                 Section {

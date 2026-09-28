@@ -132,6 +132,7 @@ struct GestureRecognizer {
     private var lastHandTime: Double = 0
     private var candidate: Sign = .none
     private var candidateSince: Double = 0
+    private var candidateLastSeen: Double = 0
     private var latched: Sign = .none
     private var latchedLastSeen: Double = 0
     private var cooldownUntil: Double = 0
@@ -215,7 +216,12 @@ struct GestureRecognizer {
             }
         }
 
-        guard current != .none else {
+        if current == .none {
+            // Жест «потерялся» на долю секунды (моргнула рука, дрогнул палец) — не начинаем заново.
+            if candidate != .none, time - candidateLastSeen < 0.15 {
+                let progress = min(1, (time - candidateSince) / holdDuration)
+                return RecognitionResult(sign: candidate, holdProgress: min(progress, 0.99))
+            }
             candidate = .none
             return RecognitionResult()
         }
@@ -224,6 +230,7 @@ struct GestureRecognizer {
             candidate = current
             candidateSince = time
         }
+        candidateLastSeen = time
 
         let progress = min(1, (time - candidateSince) / holdDuration)
         if progress >= 1 {

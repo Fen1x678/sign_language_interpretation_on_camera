@@ -16,13 +16,18 @@ enum CameraError: LocalizedError {
     }
 }
 
+/// Рука, найденная на кадре: 21 точка в координатах камеры (0…1, начало — левый верхний угол)
+/// и уверенность нейросети в каждой точке (0…1). Точка (-1, -1) с уверенностью 0 — не найдена совсем.
+/// Точки с низкой уверенностью (например, пальцы, скрытые при повороте руки боком) тоже передаются:
+/// дальше они учитываются с меньшим весом, а не отбрасываются.
+typealias CameraHand = (points: [CGPoint], confidence: [Float])
+
 /// Кадр, обработанный камерой:
-/// • hands — найденные руки (до двух), у каждой 21 точка в координатах камеры (0…1, начало — левый верхний угол),
-///   точка (-1, -1) — не найдена;
+/// • hands — найденные руки (до двух);
 /// • brightness — яркость сцены по данным камеры (EXIF BrightnessValue, шкала APEX):
 ///   примерно −3 и ниже — темно, 0 — полумрак, 2…5 — комната со светом, 7+ — улица днём.
 ///   NaN — камера не сообщила яркость.
-typealias CameraFrame = (hands: [[CGPoint]], brightness: Double)
+typealias CameraFrame = (hands: [CameraHand], brightness: Double)
 
 /// Блоки структурной схемы: «Камера → Получение видеокадров → Обнаружение руки → Определение ключевых точек».
 final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
@@ -185,17 +190,22 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 .littleMCP, .littlePIP, .littleDIP, .littleTip
             ]
 
-            var hands: [[CGPoint]] = []
+            var hands: [CameraHand] = []
             for observation in observations {
                 guard let recognized = try? observation.recognizedPoints(.all) else { continue }
-                let points: [CGPoint] = order.map { name in
-                    guard let point = recognized[name], point.confidence > 0.3 else {
-                        return CGPoint(x: -1, y: -1)
+                var points: [CGPoint] = []
+                var confidence: [Float] = []
+                for name in order {
+                    if let point = recognized[name], point.confidence > 0.01 {
+                        // Vision: начало координат внизу слева → переводим в координаты устройства (вверху слева).
+                        points.append(CGPoint(x: point.location.x, y: 1 - point.location.y))
+                        confidence.append(point.confidence)
+                    } else {
+                        points.append(CGPoint(x: -1, y: -1))
+                        confidence.append(0)
                     }
-                    // Vision: начало координат внизу слева → переводим в координаты устройства (вверху слева).
-                    return CGPoint(x: point.location.x, y: 1 - point.location.y)
                 }
-                hands.append(points)
+                hands.append((points: points, confidence: confidence))
             }
             continuation.yield((hands: hands, brightness: brightness))
         } catch {

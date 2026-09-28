@@ -92,11 +92,18 @@ final class GestureViewModel: ObservableObject {
     @Published private(set) var recording: RecordingState = .idle
     @Published private(set) var recordingWord = ""
     @Published private(set) var recordingDynamic = false
+    /// Подсказка к текущей записи: какой ракурс показать.
+    @Published private(set) var recordingPrompt = ""
+    /// Номер ракурса и сколько их всего (запись с нескольких ракурсов).
+    @Published private(set) var recordingStep = 1
+    @Published private(set) var recordingSteps = 1
+    private var pendingPrompts: [String] = []
     private var recordedFrames: [SignFrame] = []
     private var recordingStart: Double = 0
     private var recordingDuration: Double { recordingDynamic ? 2.5 : 2.0 }
 
     // MARK: Движение рук
+    private var smoother = HandSmoother()
     private var motionBuffer: [(time: Double, features: FrameFeatures)] = []
     private var previousMain: (center: CGPoint, time: Double)?
     private var lastHandSeenTime: Double = 0
@@ -178,6 +185,7 @@ final class GestureViewModel: ObservableObject {
             cameraPosition = camera.position
             handPoints = []
             previousMain = nil
+            smoother.reset()
             sceneBrightness = nil
             resetRecognition()
             if wasLightOn { setLight(true) }
@@ -227,34 +235,36 @@ final class GestureViewModel: ObservableObject {
 
         updateLight(brightness: frame.brightness, now: now)
 
-        // Координаты камеры → координаты экрана (учитывает поворот и зеркалирование фронтальной камеры).
-        var screenHands: [[CGPoint]] = []
-        var handsForRecognition: [[CGPoint]] = []
+        // Координаты камеры → координаты экрана (учитывает поворот и зеркалирование фронтальной камеры),
+        // затем сглаживание дрожания точек.
+        var samples: [HandSample] = []
+        var width: CGFloat = 0
         if !frame.hands.isEmpty, let layer = previewLayer {
-            screenHands = frame.hands.map { hand in
-                hand.map { point in
-                    point.x < 0 ? CGPoint(x: -1, y: -1) : layer.layerPointConverted(fromCaptureDevicePoint: point)
-                }
-            }
-            // Задняя камера видит собеседника «не в зеркале». Отражаем по горизонтали, чтобы
-            // жест выглядел одинаково с обеих камер, а «влево/вправо» считались со стороны жестикулирующего.
-            if cameraPosition == .back {
-                let width = layer.bounds.width
-                handsForRecognition = screenHands.map { hand in
-                    hand.map { p in p.x < 0 ? p : CGPoint(x: width - p.x, y: p.y) }
-                }
-            } else {
-                handsForRecognition = screenHands
+            width = layer.bounds.width
+            samples = frame.hands.map { hand in
+                HandSample(points: hand.points.map { point in
+                               point.x < 0 ? CGPoint(x: -1, y: -1) : layer.layerPointConverted(fromCaptureDevicePoint: point)
+                           },
+                           confidence: hand.confidence)
             }
         }
+        samples = smoother.smooth(samples, time: now)
+
+        // Для рисования скелета — только уверенно найденные точки.
+        let screenHands = samples.map { $0.thresholded() }
         if handCount != screenHands.count { handCount = screenHands.count }
         handPoints = screenHands
 
+        // Задняя камера видит собеседника «не в зеркале». Отражаем по горизонтали, чтобы
+        // жест выглядел одинаково с обеих камер, а «влево/вправо» считались со стороны жестикулирующего.
+        let recognitionSamples = cameraPosition == .back ? samples.map { $0.flipped(width: width) } : samples
+        let handsForRecognition = recognitionSamples.map { $0.thresholded() }
+
         let geometries = handsForRecognition.compactMap { HandGeometry(points: $0) }
         if !geometries.isEmpty { lastHandSeenTime = now }
-        let velocity = trackVelocity(geometries, now: now)
-        let poseFrame = SignFrame.make(from: geometries)
-        let motionFrame = velocity.flatMap { SignFrame.make(from: geometries, velocity: $0) }
+        let velocity = trackVelocity(recognitionSamples.filter { $0.palmSize > 10 }, now: now)
+        let poseFrame = SignFrame.make(from: recognitionSamples)
+        let motionFrame = velocity.flatMap { SignFrame.make(from: recognitionSamples, velocity: $0) }
 
         // Запись нового жеста.
         switch recording {
@@ -294,21 +304,22 @@ final class GestureViewModel: ObservableObject {
     }
 
     /// Скорость ведущей руки. Ведущая — та, что ближе к прошлому положению (чтобы не «прыгать» между руками).
-    private func trackVelocity(_ hands: [HandGeometry], now: Double) -> CGVector? {
+    private func trackVelocity(_ hands: [HandSample], now: Double) -> CGVector? {
         guard !hands.isEmpty else {
             previousMain = nil
             return nil
         }
-        let main: HandGeometry
+        let main: HandSample
         if let previous = previousMain {
             main = hands.min { dist($0.center, previous.center) < dist($1.center, previous.center) }!
         } else {
-            main = hands.max { $0.size < $1.size }!
+            main = hands.max { $0.palmSize < $1.palmSize }!
         }
-        defer { previousMain = (center: main.center, time: now) }
+        let center = main.center
+        defer { previousMain = (center: center, time: now) }
 
         guard let previous = previousMain, now - previous.time < 0.3 else { return .zero }
-        return SignMatching.velocity(from: previous.center, to: main.center, size: main.size, dt: now - previous.time)
+        return SignMatching.velocity(from: previous.center, to: center, size: main.palmSize, dt: now - previous.time)
     }
 
     /// Возвращает true, если распознан жест с движением.
@@ -323,7 +334,7 @@ final class GestureViewModel: ObservableObject {
         motionBuffer.removeAll { now - $0.time > window }
 
         frameCounter += 1
-        guard frameCounter % 3 == 0, motionBuffer.count >= 10 else { return false }
+        guard frameCounter % 4 == 0, motionBuffer.count >= 10 else { return false }
 
         // Берём каждый второй кадр — так же, как при подготовке записанного жеста.
         let stream = stride(from: motionBuffer.count % 2, to: motionBuffer.count, by: 2).map { motionBuffer[$0].features }
@@ -470,16 +481,34 @@ final class GestureViewModel: ObservableObject {
 
     // MARK: Обучение новому жесту
 
-    func startRecording(word: String, dynamic: Bool) {
+    /// Запись нового жеста. `multiAngle` — записать сразу с трёх ракурсов (прямо, левее, правее):
+    /// так жест потом лучше узнаётся, когда его показывают под углом.
+    func startRecording(word: String, dynamic: Bool, multiAngle: Bool = true) {
         let cleaned = word.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !cleaned.isEmpty, recording == .idle else { return }
         recordingWord = cleaned
         recordingDynamic = dynamic
-        recordedFrames = []
         if mode != .translate { mode = .translate }
 
+        pendingPrompts = multiAngle
+            ? ["Прямо к камере",
+               "Чуть поверните руку влево (или сместите телефон)",
+               "Чуть поверните руку вправо (или сместите телефон)"]
+            : ["Прямо к камере"]
+        recordingSteps = pendingPrompts.count
+        recordingStep = 0
+        startNextAngle()
+    }
+
+    private func startNextAngle() {
+        guard !pendingPrompts.isEmpty else { return }
+        recordingPrompt = pendingPrompts.removeFirst()
+        recordingStep += 1
+        recordedFrames = []
+        let countdown = recordingStep == 1 ? 3 : 2
+
         Task {
-            for n in stride(from: 3, through: 1, by: -1) {
+            for n in stride(from: countdown, through: 1, by: -1) {
                 recording = .countdown(n)
                 try? await Task.sleep(for: .seconds(1))
             }
@@ -496,24 +525,31 @@ final class GestureViewModel: ObservableObject {
         let groups = Dictionary(grouping: recordedFrames, by: { $0.handCount })
         let handCount = groups.max { $0.value.count < $1.value.count }?.key ?? 1
         let frames = recordedFrames.filter { $0.handCount == handCount }
+        recordedFrames = []
 
+        var saved = false
         if recordingDynamic {
             let template = SignMatching.prepareTemplate(frames)
             if frames.count >= 15 && template.count >= 5 {
                 library.addMotion(word: recordingWord, frames: template)
-                savedNotice(handCount: handCount)
-            } else {
-                failedNotice()
+                saved = true
             }
-        } else {
-            if frames.count >= 8 {
-                library.addPoses(word: recordingWord, frames: frames)
-                savedNotice(handCount: handCount)
-            } else {
-                failedNotice()
-            }
+        } else if frames.count >= 8 {
+            library.addPoses(word: recordingWord, frames: frames)
+            saved = true
         }
-        recordedFrames = []
+
+        guard saved else {
+            pendingPrompts = []
+            failedNotice()
+            return
+        }
+        if pendingPrompts.isEmpty {
+            savedNotice(handCount: handCount)
+        } else {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            startNextAngle()
+        }
     }
 
     private func savedNotice(handCount: Int) {
