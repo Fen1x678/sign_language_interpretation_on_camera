@@ -20,7 +20,8 @@ enum CameraError: LocalizedError {
 /// и уверенность нейросети в каждой точке (0…1). Точка (-1, -1) с уверенностью 0 — не найдена совсем.
 /// Точки с низкой уверенностью (например, пальцы, скрытые при повороте руки боком) тоже передаются:
 /// дальше они учитываются с меньшим весом, а не отбрасываются.
-typealias CameraHand = (points: [CGPoint], confidence: [Float])
+/// chirality — какая это рука по оценке Vision: +1 правая, −1 левая, 0 — неизвестно.
+typealias CameraHand = (points: [CGPoint], confidence: [Float], chirality: Int)
 
 /// Кадр, обработанный камерой:
 /// • hands — найденные руки (до двух);
@@ -47,6 +48,12 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private let videoOutput = AVCaptureVideoDataOutput()
     private let videoQueue = DispatchQueue(label: "gesture.camera.video", qos: .userInteractive)
     private var currentInput: AVCaptureDeviceInput?
+    /// Запрос Vision создаётся один раз и переиспользуется для каждого кадра (только на videoQueue).
+    private let handPoseRequest: VNDetectHumanHandPoseRequest = {
+        let request = VNDetectHumanHandPoseRequest()
+        request.maximumHandCount = 2
+        return request
+    }()
     private var isConfigured = false
 
     override init() {
@@ -169,8 +176,7 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             brightness = value
         }
 
-        let request = VNDetectHumanHandPoseRequest()
-        request.maximumHandCount = 2
+        let request = handPoseRequest
 
         let handler = VNImageRequestHandler(cmSampleBuffer: sampleBuffer, orientation: .up, options: [:])
         do {
@@ -205,7 +211,13 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                         confidence.append(0)
                     }
                 }
-                hands.append((points: points, confidence: confidence))
+                let chirality: Int
+                switch observation.chirality {
+                case .left:  chirality = -1
+                case .right: chirality = 1
+                default:     chirality = 0
+                }
+                hands.append((points: points, confidence: confidence, chirality: chirality))
             }
             continuation.yield((hands: hands, brightness: brightness))
         } catch {

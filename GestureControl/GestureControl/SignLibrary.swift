@@ -8,6 +8,8 @@ import Combine
 struct HandSample {
     var points: [CGPoint]
     var confidence: [Float]
+    /// Какая это рука по оценке Vision: +1 правая, −1 левая, 0 — неизвестно.
+    var chirality: Int = 0
 
     private static let palmJoints = [0, 5, 9, 13, 17]
 
@@ -43,7 +45,8 @@ struct HandSample {
     /// Отражение по горизонтали внутри области шириной `width`.
     func flipped(width: CGFloat) -> HandSample {
         HandSample(points: points.map { $0.x < 0 ? $0 : CGPoint(x: width - $0.x, y: $0.y) },
-                   confidence: confidence)
+                   confidence: confidence,
+                   chirality: chirality)
     }
 }
 
@@ -62,6 +65,8 @@ struct HandSmoother {
         var points: [CGPoint]
         var velocity: [CGVector]
         var time: Double
+        /// Какая это рука, усреднённо по кадрам: одиночные ошибки Vision не мешают.
+        var chirality: Double
     }
     private var tracks: [Track] = []
 
@@ -98,7 +103,8 @@ struct HandSmoother {
             guard let i = match, best < max(size * 1.5, 40), time - tracks[i].time < 0.25 else {
                 newTracks.append(Track(points: hand.points,
                                        velocity: Array(repeating: .zero, count: Joint.count),
-                                       time: time))
+                                       time: time,
+                                       chirality: Double(hand.chirality)))
                 result.append(hand)
                 continue
             }
@@ -122,8 +128,13 @@ struct HandSmoother {
                 points[j] = CGPoint(x: previous.points[j].x + a * (points[j].x - previous.points[j].x),
                                     y: previous.points[j].y + a * (points[j].y - previous.points[j].y))
             }
-            newTracks.append(Track(points: points, velocity: velocity, time: time))
-            result.append(HandSample(points: points, confidence: hand.confidence))
+            var chirality = previous.chirality
+            if hand.chirality != 0 {
+                chirality = chirality * 0.8 + Double(hand.chirality) * 0.2
+            }
+            newTracks.append(Track(points: points, velocity: velocity, time: time, chirality: chirality))
+            result.append(HandSample(points: points, confidence: hand.confidence,
+                                     chirality: chirality > 0.3 ? 1 : (chirality < -0.3 ? -1 : 0)))
         }
         tracks = newTracks
         return result
@@ -139,6 +150,8 @@ struct HandPose: Codable, Equatable {
     var points: [Float]
     /// Уверенность в каждой из 21 точки. nil — старая запись, считаем все точки надёжными.
     var confidence: [Float]?
+    /// Какая это рука: +1 правая, −1 левая, 0 или nil — неизвестно (записи прошлых версий).
+    var chirality: Int?
 
     func weight(_ i: Int) -> Float {
         guard let confidence, i < confidence.count else { return 1 }
@@ -153,12 +166,15 @@ struct SignFrame: Codable, Equatable {
     var hands: [HandPose]
     /// Положение второй руки относительно первой [dx, dy] в размерах ладони. Пусто для одной руки.
     var relative: [Float]
-    /// Скорость ведущей руки [vx, vy], приведённая к диапазону −1…1. Пусто для позы.
+    /// Скорость ведущей руки [vx, vy], поделённая на max(|v|, 1,5) — формат прошлых версий. Пусто для позы.
     var velocity: [Float]
+    /// Скорость ведущей руки [vx, vy] в ладонях в секунду. nil — запись прошлой версии.
+    var rawVelocity: [Float]?
 
     var handCount: Int { hands.count }
 
     /// Кадр из найденных рук. Учитываются только пригодные руки (см. `HandSample.isUsable`).
+    /// `velocity` — скорость ведущей руки в ладонях в секунду (для жестов с движением).
     static func make(from samples: [HandSample], velocity: CGVector? = nil) -> SignFrame? {
         let usable = samples.filter(\.isUsable)
         guard !usable.isEmpty else { return nil }
@@ -175,7 +191,7 @@ struct SignFrame: Codable, Equatable {
                 pts.append(Float((point.x - origin.x) / size))
                 pts.append(Float((point.y - origin.y) / size))
             }
-            return HandPose(points: pts, confidence: hand.confidence)
+            return HandPose(points: pts, confidence: hand.confidence, chirality: hand.chirality)
         }
 
         var relative: [Float] = []
@@ -184,265 +200,13 @@ struct SignFrame: Codable, Equatable {
             relative = [Float((chosen[1].center.x - chosen[0].center.x) / scale),
                         Float((chosen[1].center.y - chosen[0].center.y) / scale)]
         }
-        let v: [Float] = velocity.map { [Float($0.dx), Float($0.dy)] } ?? []
-        return SignFrame(hands: hands, relative: relative, velocity: v)
-    }
-
-    /// Зеркальное отражение по горизонтали: жест левой руки ↔ тот же жест правой рукой.
-    func mirrored() -> SignFrame {
-        let flipped = hands.map { hand in
-            HandPose(points: hand.points.enumerated().map { $0.offset % 2 == 0 ? -$0.element : $0.element },
-                     confidence: hand.confidence)
+        guard let velocity else {
+            return SignFrame(hands: hands, relative: relative, velocity: [])
         }
-        return SignFrame(
-            hands: Array(flipped.reversed()),
-            relative: relative.count == 2 ? [relative[0], -relative[1]] : relative,
-            velocity: velocity.count == 2 ? [-velocity[0], velocity[1]] : velocity
-        )
-    }
-
-    /// Как выглядел бы этот кадр, если бы камера смотрела под другим углом.
-    /// yaw — камера сбоку (поворот вокруг вертикальной оси), pitch — сверху или снизу; в градусах.
-    /// При взгляде под углом изображение сжимается по соответствующей оси (ракурсное сокращение).
-    func viewed(yaw: Float, pitch: Float) -> SignFrame {
-        let cx = cos(yaw * Float.pi / 180)
-        let cy = cos(pitch * Float.pi / 180)
-        var scales: [Float] = []
-        let newHands = hands.map { hand -> HandPose in
-            var pts = hand.points
-            for i in stride(from: 0, to: pts.count - 1, by: 2) {
-                pts[i] *= cx
-                pts[i + 1] *= cy
-            }
-            // Заново нормируем на видимый размер ладони — так же, как для живого кадра.
-            let palm = max(1e-3, (pts[18] * pts[18] + pts[19] * pts[19]).squareRoot())
-            scales.append(palm)
-            return HandPose(points: pts.map { $0 / palm }, confidence: hand.confidence)
-        }
-        var newRelative = relative
-        if relative.count == 2, !scales.isEmpty {
-            let s = scales.reduce(0, +) / Float(scales.count)
-            newRelative = [relative[0] * cx / s, relative[1] * cy / s]
-        }
-        let newVelocity = velocity.count == 2 ? [velocity[0] * cx, velocity[1] * cy] : velocity
-        return SignFrame(hands: newHands, relative: newRelative, velocity: newVelocity)
-    }
-}
-
-// MARK: - Признаки, одинаковые для разных людей
-
-/// Признаки кадра, почти не зависящие от размера руки, длины пальцев и расстояния до камеры.
-///
-/// На каждую руку 24 числа:
-/// • 15 углов сгиба суставов (по 3 на палец) — главное, чем отличаются жесты;
-/// • 4 угла между соседними пальцами (насколько пальцы разведены);
-/// • 4 расстояния от кончика большого пальца до кончиков остальных (кольца, щепоти);
-/// • 1 признак: к камере ладонь или тыльная сторона.
-/// У каждого признака есть вес: если точки плохо видны (палец скрыт), признак учитывается слабее.
-/// Отдельно — направление кисти (куда «смотрят» пальцы).
-struct FrameFeatures {
-    var shapes: [[Float]]
-    var weights: [[Float]]
-    var orients: [[Float]]
-    var relative: [Float]
-    var velocity: [Float]
-
-    init(_ frame: SignFrame) {
-        var shapes: [[Float]] = []
-        var weights: [[Float]] = []
-        for hand in frame.hands {
-            let (s, w) = FrameFeatures.shape(of: hand)
-            shapes.append(s)
-            weights.append(w)
-        }
-        self.shapes = shapes
-        self.weights = weights
-        orients = frame.hands.map { FrameFeatures.orientation(of: $0) }
-        relative = frame.relative
-        velocity = frame.velocity
-    }
-
-    private static let chains: [[Int]] = [
-        [0, 1, 2, 3, 4],       // большой
-        [0, 5, 6, 7, 8],       // указательный
-        [0, 9, 10, 11, 12],    // средний
-        [0, 13, 14, 15, 16],   // безымянный
-        [0, 17, 18, 19, 20]    // мизинец
-    ]
-
-    private static func point(_ pose: HandPose, _ i: Int) -> SIMD2<Float> {
-        SIMD2(pose.points[2 * i], pose.points[2 * i + 1])
-    }
-
-    private static func length(_ v: SIMD2<Float>) -> Float {
-        (v.x * v.x + v.y * v.y).squareRoot()
-    }
-
-    /// Угол между векторами, 0…1 (0 — одно направление, 1 — противоположные).
-    private static func angle(_ a: SIMD2<Float>, _ b: SIMD2<Float>) -> Float {
-        let la = length(a), lb = length(b)
-        guard la > 1e-4, lb > 1e-4 else { return 0 }
-        let c = max(-1, min(1, (a.x * b.x + a.y * b.y) / (la * lb)))
-        return acos(c) / Float.pi
-    }
-
-    static func shape(of pose: HandPose) -> ([Float], [Float]) {
-        func pt(_ i: Int) -> SIMD2<Float> { point(pose, i) }
-        func w(_ joints: Int...) -> Float { joints.map { pose.weight($0) }.min() ?? 1 }
-
-        var f: [Float] = []
-        var wt: [Float] = []
-        f.reserveCapacity(24)
-        wt.reserveCapacity(24)
-
-        // Сгиб суставов: угол между соседними костями пальца.
-        for chain in chains {
-            for k in 1...3 {
-                f.append(angle(pt(chain[k]) - pt(chain[k - 1]), pt(chain[k + 1]) - pt(chain[k])))
-                wt.append(w(chain[k - 1], chain[k], chain[k + 1]))
-            }
-        }
-        // Разведение пальцев.
-        let directions = chains.map { pt($0[4]) - pt($0[1]) }
-        for i in 0..<4 {
-            f.append(angle(directions[i], directions[i + 1]))
-            wt.append(w(chains[i][1], chains[i][4], chains[i + 1][1], chains[i + 1][4]))
-        }
-        // Расстояния от кончика большого пальца до остальных кончиков.
-        for tip in [8, 12, 16, 20] {
-            f.append(min(1, length(pt(4) - pt(tip)) / 2))
-            wt.append(w(4, tip))
-        }
-        // Ладонь или тыльная сторона (знак векторного произведения).
-        let a = pt(5) - pt(0), b = pt(17) - pt(0)
-        let cross = a.x * b.y - a.y * b.x
-        f.append(cross / max(1e-4, length(a) * length(b)) / 2)
-        wt.append(w(0, 5, 17))
-        return (f, wt)
-    }
-
-    static func orientation(of pose: HandPose) -> [Float] {
-        let d = point(pose, 9) - point(pose, 0)
-        let l = max(1e-4, length(d))
-        return [d.x / l, d.y / l]
-    }
-
-    private static func handDistance(_ a: [Float], _ wa: [Float], _ oa: [Float],
-                                     _ b: [Float], _ wb: [Float], _ ob: [Float]) -> Float {
-        /// Взвешенное среднее отличие группы признаков. Если группа почти не видна
-        /// ни на одном кадре — считаем её «средне непохожей», а не одинаковой.
-        func group(_ range: Range<Int>) -> Float {
-            var sum: Float = 0
-            var total: Float = 0
-            for i in range {
-                let weight = min(wa[i], wb[i])
-                sum += weight * abs(a[i] - b[i])
-                total += weight
-            }
-            return total > 0.15 ? sum / total : 0.25
-        }
-        let flex = group(0..<15)
-        let spread = group(15..<19)
-        let tips = group(19..<23)
-        let palm = group(23..<24)
-        let dx = oa[0] - ob[0], dy = oa[1] - ob[1]
-        let orient = (dx * dx + dy * dy).squareRoot() / 2
-        return (1.0 * flex + 0.6 * spread + 0.8 * tips + 0.2 * palm + 0.4 * orient) / 3.0
-    }
-
-    /// Насколько два кадра непохожи: 0 — одинаковые, 1 — совсем разные.
-    static func distance(_ a: FrameFeatures, _ b: FrameFeatures) -> Float {
-        guard a.shapes.count == b.shapes.count, !a.shapes.isEmpty else { return 1 }
-        var d: Float = 0
-        for i in a.shapes.indices {
-            d += handDistance(a.shapes[i], a.weights[i], a.orients[i],
-                              b.shapes[i], b.weights[i], b.orients[i])
-        }
-        d /= Float(a.shapes.count)
-
-        if a.relative.count == 2, b.relative.count == 2 {
-            let rx = a.relative[0] - b.relative[0], ry = a.relative[1] - b.relative[1]
-            d += 0.15 * min(1, (rx * rx + ry * ry).squareRoot() / 3)
-        }
-        if a.velocity.count == 2, b.velocity.count == 2 {
-            let vx = a.velocity[0] - b.velocity[0], vy = a.velocity[1] - b.velocity[1]
-            let motion = min(1, (vx * vx + vy * vy).squareRoot() / 2)
-            d = 0.65 * d + 0.35 * motion
-        }
-        return d
-    }
-}
-
-// MARK: - Движение и DTW
-
-enum SignMatching {
-    /// Скорость, выше которой движение считается «быстрым» (ладоней в секунду).
-    /// Быстрые и очень быстрые движения приводятся к одному масштабу —
-    /// так человек, который говорит быстрее, распознаётся так же, как тот, кто медленнее.
-    static let fastSpeed: CGFloat = 1.5
-
-    /// Виртуальные ракурсы для поз (yaw, pitch в градусах): прямо, сбоку, сильно сбоку, сверху/снизу и наискосок.
-    static let poseViews: [(Float, Float)] = [(0, 0), (30, 0), (50, 0), (0, 30), (30, 30), (50, 30)]
-    /// Для жестов с движением ракурсов меньше — сравнение последовательностей дороже.
-    static let motionViews: [(Float, Float)] = [(0, 0), (35, 0), (0, 30)]
-
-    static func velocity(from a: CGPoint, to b: CGPoint, size: CGFloat, dt: Double) -> CGVector {
-        guard dt > 0, size > 0 else { return .zero }
-        let vx = (b.x - a.x) / size / CGFloat(dt)
-        let vy = (b.y - a.y) / size / CGFloat(dt)
-        let speed = (vx * vx + vy * vy).squareRoot()
-        let scale = 1 / max(speed, fastSpeed)
-        return CGVector(dx: vx * scale, dy: vy * scale)
-    }
-
-    /// Подготовка записанного жеста: убираем неподвижные кадры в начале и в конце,
-    /// берём каждый второй кадр и ограничиваем длину 30 кадрами.
-    static func prepareTemplate(_ frames: [SignFrame]) -> [SignFrame] {
-        guard !frames.isEmpty else { return [] }
-        func speed(_ f: SignFrame) -> Float {
-            guard f.velocity.count == 2 else { return 0 }
-            return (f.velocity[0] * f.velocity[0] + f.velocity[1] * f.velocity[1]).squareRoot()
-        }
-        var start = 0
-        var end = frames.count - 1
-        while start < end && speed(frames[start]) < 0.15 { start += 1 }
-        while end > start && speed(frames[end]) < 0.15 { end -= 1 }
-        start = max(0, start - 3)
-        end = min(frames.count - 1, end + 3)
-        var trimmed = Array(frames[start...end])
-        if trimmed.count < 10 { trimmed = frames }   // движения почти не было — берём всё
-
-        var halved = stride(from: 0, to: trimmed.count, by: 2).map { trimmed[$0] }
-        if halved.count > 30 {
-            let step = Float(halved.count - 1) / 29
-            halved = (0..<30).map { halved[Int((Float($0) * step).rounded())] }
-        }
-        return halved
-    }
-
-    /// DTW (динамическая трансформация временной шкалы) с открытым началом:
-    /// насколько конец потока кадров похож на шаблон жеста, с учётом разной скорости показа.
-    /// Возвращает среднюю стоимость на кадр шаблона (меньше — похоже сильнее).
-    /// `abandonAbove` — если результат заведомо хуже этого значения, расчёт прекращается досрочно (ускорение).
-    static func subsequenceDTW(template t: [FrameFeatures], stream s: [FrameFeatures],
-                               abandonAbove: Float = .infinity) -> Float {
-        let n = t.count, m = s.count
-        guard n > 1, m > 1 else { return .infinity }
-        let limit = abandonAbove * Float(n)
-        var prev = [Float](repeating: .infinity, count: m)
-        var cur = [Float](repeating: .infinity, count: m)
-        for j in 0..<m { prev[j] = FrameFeatures.distance(t[0], s[j]) }   // жест может начаться где угодно
-        for i in 1..<n {
-            cur[0] = prev[0] + FrameFeatures.distance(t[i], s[0])
-            var rowMin = cur[0]
-            for j in 1..<m {
-                cur[j] = FrameFeatures.distance(t[i], s[j]) + min(prev[j], prev[j - 1], cur[j - 1])
-                if cur[j] < rowMin { rowMin = cur[j] }
-            }
-            if rowMin > limit { return .infinity }   // дальше будет только хуже
-            swap(&prev, &cur)
-        }
-        return prev[m - 1] / Float(n)   // жест должен закончиться на последнем кадре
+        let scale = max((velocity.dx * velocity.dx + velocity.dy * velocity.dy).squareRoot(), 1.5)
+        return SignFrame(hands: hands, relative: relative,
+                         velocity: [Float(velocity.dx / scale), Float(velocity.dy / scale)],
+                         rawVelocity: [Float(velocity.dx), Float(velocity.dy)])
     }
 }
 
@@ -453,6 +217,8 @@ struct CustomSign: Codable, Identifiable, Equatable {
     var word: String
     /// Статичный жест: кадры позы.
     var poses: [SignFrame] = []
+    /// Сколько кадров позы в каждой записи, по порядку. nil — словарь прошлой версии (одна общая запись).
+    var poseCounts: [Int]?
     /// Жест с движением: каждая запись — последовательность кадров.
     var motions: [[SignFrame]] = []
     /// Сколько раз жест записывали.
@@ -461,6 +227,20 @@ struct CustomSign: Codable, Identifiable, Equatable {
     var isDynamic: Bool { !motions.isEmpty }
     var handCount: Int { poses.first?.handCount ?? motions.first?.first?.handCount ?? 1 }
     var exampleCount: Int { recordings }
+
+    /// Кадры позы, разбитые по записям.
+    var poseGroups: [[SignFrame]] {
+        guard let counts = poseCounts, counts.reduce(0, +) == poses.count else {
+            return poses.isEmpty ? [] : [poses]
+        }
+        var groups: [[SignFrame]] = []
+        var start = 0
+        for count in counts where count > 0 {
+            groups.append(Array(poses[start..<(start + count)]))
+            start += count
+        }
+        return groups
+    }
 
     init(word: String) {
         self.word = word
@@ -471,6 +251,7 @@ struct CustomSign: Codable, Identifiable, Equatable {
         id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
         word = try c.decode(String.self, forKey: .word)
         poses = try c.decodeIfPresent([SignFrame].self, forKey: .poses) ?? []
+        poseCounts = try c.decodeIfPresent([Int].self, forKey: .poseCounts)
         motions = try c.decodeIfPresent([[SignFrame]].self, forKey: .motions) ?? []
         recordings = try c.decodeIfPresent(Int.self, forKey: .recordings) ?? 1
     }
@@ -479,10 +260,15 @@ struct CustomSign: Codable, Identifiable, Equatable {
 // MARK: - Словарь и распознавание
 
 /// Словарь жестов и классификаторы:
-/// • поза — ближайший сосед (k-NN) по признакам формы кисти;
+/// • поза — k ближайших соседей (k-NN) по признакам формы кисти;
 /// • жест с движением — DTW по последовательности кадров.
-/// Каждый жест сравнивается в обычном и зеркальном виде (правая ↔ левая рука)
-/// и в нескольких виртуальных ракурсах (камера сбоку, сверху, снизу).
+/// Жест левой руки сравнивается с записанным правой рукой в зеркальном виде.
+///
+/// Защита от ложных срабатываний:
+/// • порог сходства подбирается для каждого слова по разбросу его записей;
+/// • общий множитель порогов задаёт ползунок «Чувствительность»;
+/// • жест не засчитывается, если второй по сходству почти так же похож (неоднозначность);
+/// • уже распознаваемый жест удерживается с чуть более мягким порогом («липкий» порог).
 @MainActor
 final class SignLibrary: ObservableObject {
     @Published private(set) var signs: [CustomSign] = []
@@ -493,19 +279,24 @@ final class SignLibrary: ObservableObject {
     }
 
     var hasDynamicSigns: Bool { signs.contains { $0.isDynamic } }
+    /// Сколько секунд последних кадров сравнивать с жестами с движением
+    /// (зависит от длины записанных жестов).
+    private(set) var motionWindow: Double = 2.0
 
     private struct Cache {
-        /// Все варианты позы: исходные, зеркальные и в виртуальных ракурсах.
-        var poses: [FrameFeatures] = []
-        /// Все варианты каждой записи с движением.
-        var motions: [[FrameFeatures]] = []
-        var poseThreshold: Float = 0.12
-        var motionThreshold: Float = 0.16
+        /// Кадры поз (прорежены).
+        var poses: [FrameFeatures]
+        var poseThreshold: Float
+        /// Записи с движением.
+        var motions: [MotionTemplate]
+        var motionThreshold: Float
     }
     private var cache: [UUID: Cache] = [:]
 
     /// Сколько кадров позы на слово брать для сравнения (остальные прореживаются).
-    private let maxPoseFrames = 48
+    private let maxPoseFrames = 60
+    /// Сколько кадров позы сохранять из одной записи.
+    private let posesPerRecording = 20
 
     private static let sensitivityKey = "signSensitivity"
     private let fileURL = URL.documentsDirectory.appending(path: "sign_dictionary_v2.json")
@@ -520,7 +311,11 @@ final class SignLibrary: ObservableObject {
 
     func addPoses(word: String, frames: [SignFrame]) {
         let i = indexOrCreate(word)
-        signs[i].poses += frames
+        let cleaned = cleanPoses(frames)
+        var counts = signs[i].poseCounts ?? (signs[i].poses.isEmpty ? [] : [signs[i].poses.count])
+        counts.append(cleaned.count)
+        signs[i].poses += cleaned
+        signs[i].poseCounts = counts
         signs[i].recordings += 1
         rebuildCache(for: signs[i])
         save()
@@ -537,13 +332,52 @@ final class SignLibrary: ObservableObject {
     func delete(at offsets: IndexSet) {
         for i in offsets { cache[signs[i].id] = nil }
         signs.remove(atOffsets: offsets)
+        updateMotionWindow()
         save()
     }
 
+    func sign(id: UUID) -> CustomSign? {
+        signs.first { $0.id == id }
+    }
+
+    private func index(of word: String) -> Int? {
+        signs.firstIndex { $0.word.lowercased() == word.lowercased() }
+    }
+
     private func indexOrCreate(_ word: String) -> Int {
-        if let i = signs.firstIndex(where: { $0.word.lowercased() == word.lowercased() }) { return i }
+        if let i = index(of: word) { return i }
         signs.append(CustomSign(word: word))
         return signs.count - 1
+    }
+
+    /// Чистка записанной позы: убираем кадры-выбросы (рука дёрнулась, точки найдены с ошибкой)
+    /// и оставляем не больше `posesPerRecording` кадров.
+    private func cleanPoses(_ frames: [SignFrame]) -> [SignFrame] {
+        let features = frames.map(FrameFeatures.init)
+        guard features.count > 2, let medoid = Self.medoid(of: features) else { return frames }
+        let distances = features.map { FrameFeatures.shapeDistance($0, medoid) }
+        let median = distances.sorted()[distances.count / 2]
+        let maxDistance = max(median * 2.5, 0.05)
+        let kept = zip(frames, distances).filter { $0.1 <= maxDistance }.map { $0.0 }
+        return SignMatching.evenlySpaced(kept, count: posesPerRecording)
+    }
+
+    /// Самый «типичный» кадр: сумма расстояний до остальных минимальна.
+    private static func medoid(of frames: [FrameFeatures]) -> FrameFeatures? {
+        var best: FrameFeatures?
+        var bestSum = Float.infinity
+        for a in frames {
+            var sum: Float = 0
+            for b in frames {
+                let d = FrameFeatures.shapeDistance(a, b)
+                if d.isFinite { sum += d }
+            }
+            if sum < bestSum {
+                bestSum = sum
+                best = a
+            }
+        }
+        return best
     }
 
     // MARK: Распознавание
@@ -551,123 +385,165 @@ final class SignLibrary: ObservableObject {
     /// Поза. `sticky` — жест, который уже распознаётся: для него порог немного мягче,
     /// чтобы распознавание не «мигало» от случайного дрожания руки.
     func classifyPose(_ live: FrameFeatures, sticky: UUID?) -> CustomSign? {
-        pickBest(sticky: sticky) { cache, _ in
-            guard !cache.poses.isEmpty else { return (.infinity, 1) }
-            var best = Float.infinity
-            for f in cache.poses {
-                let d = FrameFeatures.distance(live, f)
-                if d < best { best = d }
-            }
-            return (best, cache.poseThreshold)
+        let mirrored = live.mirrored()
+        let scale = Float(sensitivity)
+        var costs: [(sign: CustomSign, ratio: Float)] = []
+        for sign in signs {
+            guard let c = cache[sign.id], !c.poses.isEmpty else { continue }
+            let d = Self.poseCost(live, mirrored, c.poses)
+            if d.isFinite { costs.append((sign, d / (c.poseThreshold * scale))) }
         }
+        return decide(costs, sticky: sticky)?.sign
     }
 
-    /// Жест с движением по последним кадрам.
-    func classifyMotion(_ stream: [FrameFeatures]) -> CustomSign? {
-        pickBest(sticky: nil) { cache, limit in
-            guard !cache.motions.isEmpty else { return (.infinity, 1) }
+    /// Лучший жест с движением, который заканчивается на последнем кадре потока.
+    /// nil — ни один жест не похож достаточно или выбор неоднозначен.
+    func bestMotion(_ stream: MotionStream) -> MotionSpotter.Match? {
+        guard stream.frames.count >= 4 else { return nil }
+        let scale = Float(sensitivity)
+        var costs: [(sign: CustomSign, ratio: Float)] = []
+        for sign in signs {
+            guard let c = cache[sign.id], !c.motions.isEmpty else { continue }
+            let limit = c.motionThreshold * scale
             var best = Float.infinity
-            for template in cache.motions {
-                let d = SignMatching.subsequenceDTW(template: template, stream: stream,
-                                                    abandonAbove: min(best, limit * 1.2))
-                if d < best { best = d }
+            for template in c.motions {
+                // Если жест заведомо не подходит, DTW прекращается досрочно.
+                best = min(best, template.cost(on: stream, abandonAbove: min(best, limit * 1.3)))
             }
-            return (best, cache.motionThreshold)
+            if best.isFinite { costs.append((sign, best / limit)) }
         }
+        guard let best = decide(costs, sticky: nil) else { return nil }
+        return MotionSpotter.Match(id: best.sign.id, cost: best.ratio)
+    }
+
+    /// Среднее расстояние до трёх ближайших кадров позы (в обычном или зеркальном виде).
+    private static func poseCost(_ live: FrameFeatures, _ mirrored: FrameFeatures,
+                                 _ poses: [FrameFeatures]) -> Float {
+        let k = SignMatching.poseNeighbours
+        var nearest: [Float] = []
+        for pose in poses {
+            let d = min(FrameFeatures.shapeDistance(live, pose), FrameFeatures.shapeDistance(mirrored, pose))
+            guard d.isFinite else { continue }
+            if nearest.count < k {
+                nearest.append(d)
+                nearest.sort()
+            } else if d < nearest[k - 1] {
+                nearest[k - 1] = d
+                nearest.sort()
+            }
+        }
+        guard !nearest.isEmpty else { return .infinity }
+        return nearest.reduce(0, +) / Float(nearest.count)
     }
 
     /// Выбирает самый похожий жест, если он достаточно похож и явно лучше второго по сходству.
-    /// `cost` получает кэш жеста и предел, после которого жест точно не подходит (для ускорения).
-    private func pickBest(sticky: UUID?, cost: (Cache, Float) -> (Float, Float)) -> CustomSign? {
-        let scale = Float(sensitivity)
-        var best: CustomSign?
-        var bestRatio = Float.infinity
-        var secondRatio = Float.infinity
+    /// `ratio` — расстояние, делённое на порог слова: меньше 1 — жест подходит.
+    private func decide(_ costs: [(sign: CustomSign, ratio: Float)],
+                        sticky: UUID?) -> (sign: CustomSign, ratio: Float)? {
+        let sorted = costs.sorted { $0.ratio < $1.ratio }
+        guard let best = sorted.first else { return nil }
+        let second = sorted.count > 1 ? sorted[1].ratio : .infinity
+        let ambiguity = SignMatching.ambiguityRatio
 
-        for sign in signs {
-            guard let c = cache[sign.id] else { continue }
-            let roughLimit = max(c.poseThreshold, c.motionThreshold) * scale * 1.3
-            let (d, threshold) = cost(c, roughLimit)
-            guard d.isFinite else { continue }
-            var limit = threshold * scale
-            if sign.id == sticky { limit *= 1.3 }
-            let ratio = d / limit
-            if ratio < bestRatio {
-                secondRatio = bestRatio
-                bestRatio = ratio
-                best = sign
-            } else if ratio < secondRatio {
-                secondRatio = ratio
-            }
+        // «Липкий» порог: жест, который уже распознаётся, отпускаем не сразу.
+        if let sticky, let current = sorted.first(where: { $0.sign.id == sticky }),
+           current.ratio < SignMatching.stickyFactor, current.ratio <= best.ratio * ambiguity {
+            return current
         }
 
-        guard let best, bestRatio < 1 else { return nil }
-        if secondRatio < bestRatio * 1.12 { return nil }   // неоднозначно — не угадываем
+        guard best.ratio < 1 else { return nil }
+        if second < best.ratio * ambiguity { return nil }   // неоднозначно — не угадываем
         return best
+    }
+
+    // MARK: Проверка похожих слов при записи
+
+    /// Другое слово словаря, с позой которого можно перепутать новую запись.
+    func similarPose(to frames: [SignFrame], excludingWord word: String) -> CustomSign? {
+        let features = frames.map(FrameFeatures.init)
+        guard let medoid = Self.medoid(of: features) else { return nil }
+        let own = index(of: word).map { signs[$0].id }
+        let mirrored = medoid.mirrored()
+        return signs
+            .filter { $0.id != own }
+            .compactMap { sign -> (sign: CustomSign, ratio: Float)? in
+                guard let c = cache[sign.id], !c.poses.isEmpty else { return nil }
+                return (sign, Self.poseCost(medoid, mirrored, c.poses) / c.poseThreshold)
+            }
+            .filter { $0.ratio < 1 }
+            .min { $0.ratio < $1.ratio }?.sign
+    }
+
+    /// Другое слово словаря, с жестом которого можно перепутать новую запись с движением.
+    func similarMotion(to frames: [SignFrame], excludingWord word: String) -> CustomSign? {
+        let stream = MotionStream(frames.map(FrameFeatures.init))
+        let own = index(of: word).map { signs[$0].id }
+        return signs
+            .filter { $0.id != own }
+            .compactMap { sign -> (sign: CustomSign, ratio: Float)? in
+                guard let c = cache[sign.id], !c.motions.isEmpty else { return nil }
+                let cost = c.motions.map { $0.cost(on: stream) }.min() ?? .infinity
+                return (sign, cost / c.motionThreshold)
+            }
+            .filter { $0.ratio < 1 }
+            .min { $0.ratio < $1.ratio }?.sign
     }
 
     // MARK: Кэш признаков и пороги
 
     private func rebuildCache(for sign: CustomSign) {
-        var c = Cache()
-
-        // Позы: прореживаем, затем добавляем зеркальные варианты и виртуальные ракурсы.
-        var poses = sign.poses
-        if poses.count > maxPoseFrames {
-            let step = Float(poses.count - 1) / Float(maxPoseFrames - 1)
-            poses = (0..<maxPoseFrames).map { poses[Int((Float($0) * step).rounded())] }
-        }
-        for frame in poses {
-            for (yaw, pitch) in SignMatching.poseViews {
-                let view = frame.viewed(yaw: yaw, pitch: pitch)
-                c.poses.append(FrameFeatures(view))
-                c.poses.append(FrameFeatures(view.mirrored()))
-            }
-        }
-
-        // Движения: каждая запись в нескольких ракурсах и зеркально.
-        for motion in sign.motions {
-            for (yaw, pitch) in SignMatching.motionViews {
-                let view = motion.map { $0.viewed(yaw: yaw, pitch: pitch) }
-                c.motions.append(view.map(FrameFeatures.init))
-                c.motions.append(view.map { FrameFeatures($0.mirrored()) })
-            }
-        }
-
-        c.poseThreshold = Self.poseThreshold(for: poses.map(FrameFeatures.init))
-        c.motionThreshold = Self.motionThreshold(for: sign.motions.map { $0.map(FrameFeatures.init) })
-        cache[sign.id] = c
+        // Позы: из каждой записи берём поровну кадров, чтобы ни одна запись не «перевешивала».
+        let groups = sign.poseGroups
+        let perGroup = max(8, maxPoseFrames / max(1, groups.count))
+        let poseGroups = groups.map { SignMatching.evenlySpaced($0, count: perGroup).map(FrameFeatures.init) }
+        let motions = sign.motions.compactMap(MotionTemplate.init)
+        cache[sign.id] = Cache(poses: poseGroups.flatMap { $0 },
+                               poseThreshold: Self.poseThreshold(poseGroups),
+                               motions: motions,
+                               motionThreshold: Self.motionThreshold(motions))
+        updateMotionWindow()
     }
 
-    /// Порог для позы подбирается по разбросу записанных примеров:
-    /// если жест записали несколько разных людей или с разных ракурсов, порог мягче.
-    private static func poseThreshold(for frames: [FrameFeatures]) -> Float {
-        guard frames.count > 12 else { return 0.12 }
-        var distances: [Float] = []
-        for i in stride(from: 0, to: frames.count, by: 4) {
-            var best = Float.infinity
-            for j in frames.indices where abs(i - j) > 6 {
-                best = min(best, FrameFeatures.distance(frames[i], frames[j]))
+    private func updateMotionWindow() {
+        let longest = cache.values.flatMap(\.motions).map(\.frames.count).max() ?? 0
+        motionWindow = min(3.0, max(1.5, Double(longest) / SignMatching.sampleRate + 0.8))
+    }
+
+    /// Порог для позы. Если записей несколько, смотрим, насколько они отличаются друг от друга:
+    /// например, у разных людей жест выглядит по-разному, и порог нужен шире.
+    private static func poseThreshold(_ groups: [[FrameFeatures]]) -> Float {
+        let base = SignMatching.basePoseThreshold
+        guard groups.count >= 2 else { return base }
+        var gaps: [Float] = []
+        for (g, group) in groups.enumerated() {
+            let others = groups.enumerated().filter { $0.offset != g }.flatMap { $0.element }
+            for frame in group {
+                let mirrored = frame.mirrored()
+                let nearest = others
+                    .map { min(FrameFeatures.shapeDistance(frame, $0), FrameFeatures.shapeDistance(mirrored, $0)) }
+                    .min() ?? .infinity
+                if nearest.isFinite { gaps.append(nearest) }
             }
-            if best.isFinite { distances.append(best) }
         }
-        guard !distances.isEmpty else { return 0.12 }
-        distances.sort()
-        let p90 = distances[Int(Float(distances.count - 1) * 0.9)]
-        return min(0.18, max(0.10, p90 * 3))
+        guard !gaps.isEmpty else { return base }
+        let spread = gaps.sorted()[gaps.count / 2]
+        return min(max(base, spread * 1.5), base * SignMatching.maxThresholdGrowth)
     }
 
     /// Порог для жеста с движением: по тому, насколько отличаются между собой записи одного слова.
-    private static func motionThreshold(for motions: [[FrameFeatures]]) -> Float {
-        guard motions.count >= 2 else { return 0.16 }
-        var worst: Float = 0
-        for i in motions.indices {
-            for j in motions.indices where i != j {
-                let d = SignMatching.subsequenceDTW(template: motions[i], stream: motions[j])
-                if d.isFinite { worst = max(worst, d) }
+    private static func motionThreshold(_ templates: [MotionTemplate]) -> Float {
+        let base = SignMatching.baseMotionThreshold
+        guard templates.count >= 2 else { return base }
+        var costs: [Float] = []
+        for (i, a) in templates.enumerated() {
+            for (j, b) in templates.enumerated() where i != j {
+                let c = a.cost(on: MotionStream(b.frames))
+                if c.isFinite { costs.append(c) }
             }
         }
-        return min(0.26, max(0.13, worst * 1.3))
+        guard !costs.isEmpty else { return base }
+        let mean = costs.reduce(0, +) / Float(costs.count)
+        return min(max(base, mean * 1.3), base * SignMatching.maxThresholdGrowth)
     }
 
     // MARK: Хранение

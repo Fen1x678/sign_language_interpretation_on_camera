@@ -15,6 +15,17 @@ enum RecordingState: Equatable {
     case recording(Double)   // прогресс 0…1
 }
 
+/// Данные, которые меняются на каждом кадре. Вынесены отдельно от `GestureViewModel`,
+/// чтобы 30 раз в секунду перерисовывались только скелет рук и индикаторы, а не весь интерфейс.
+@MainActor
+final class LiveState: ObservableObject {
+    /// Точки найденных рук (одна или две) в координатах экрана — для отрисовки скелета.
+    @Published var handPoints: [[CGPoint]] = []
+    /// Прогресс удержания статичного жеста, 0…1.
+    @Published var holdProgress: Double = 0
+    @Published var fps = 0
+}
+
 /// Режим подсветки.
 enum LightMode: String, CaseIterable, Identifiable {
     case auto, on, off
@@ -55,13 +66,11 @@ final class GestureViewModel: ObservableObject {
     }
 
     // MARK: Результат распознавания
-    /// Точки найденных рук (одна или две) в координатах экрана — для отрисовки скелета.
-    @Published private(set) var handPoints: [[CGPoint]] = []
+    /// Скелет рук, прогресс удержания и FPS — меняются на каждом кадре.
+    let live = LiveState()
     @Published private(set) var handCount = 0
     var isHandDetected: Bool { handCount > 0 }
     @Published private(set) var currentSign: Sign = .none
-    @Published private(set) var holdProgress: Double = 0
-    @Published private(set) var fps: Double = 0
     @Published private(set) var cameraError: String?
     @Published private(set) var notice: String?
     @Published var isRecognitionEnabled = true {
@@ -98,18 +107,22 @@ final class GestureViewModel: ObservableObject {
     @Published private(set) var recordingStep = 1
     @Published private(set) var recordingSteps = 1
     private var pendingPrompts: [String] = []
-    private var recordedFrames: [SignFrame] = []
+    private var recordedFrames: [(time: Double, item: SignFrame)] = []
+    /// Похожее слово словаря, найденное при записи (предупреждаем в конце записи).
+    private var similarWord: String?
+    private var recordingTooStill = false
     private var recordingStart: Double = 0
     private var recordingDuration: Double { recordingDynamic ? 2.5 : 2.0 }
 
     // MARK: Движение рук
     private var smoother = HandSmoother()
-    private var motionBuffer: [(time: Double, features: FrameFeatures)] = []
-    private var previousMain: (center: CGPoint, time: Double)?
+    private var motionBuffer: [(time: Double, item: FrameFeatures)] = []
+    /// Положения ведущей руки за последние доли секунды — для расчёта скорости.
+    private var mainHistory: [(time: Double, center: CGPoint)] = []
+    private var spotter = MotionSpotter()
     private var lastHandSeenTime: Double = 0
     private var frameCounter = 0
     private var motionCooldownUntil: Double = 0
-    private let motionWindow: Double = 2.0
 
     // MARK: Режим «Перевод»
     @Published private(set) var phraseWords: [String] = []
@@ -141,6 +154,8 @@ final class GestureViewModel: ObservableObject {
     private var recognizer = GestureRecognizer()
     private let synthesizer = AVSpeechSynthesizer()
     private var lastFrameTime: Double = 0
+    private var fpsAverage: Double = 0
+    private var lastFPSUpdate: Double = 0
     private var started = false
 
     init() {
@@ -183,8 +198,8 @@ final class GestureViewModel: ObservableObject {
         do {
             try camera.switchCamera()
             cameraPosition = camera.position
-            handPoints = []
-            previousMain = nil
+            live.handPoints = []
+            mainHistory.removeAll()
             smoother.reset()
             sceneBrightness = nil
             resetRecognition()
@@ -216,22 +231,17 @@ final class GestureViewModel: ObservableObject {
 
     private func resetRecognition() {
         recognizer.reset()
+        spotter.reset()
         motionBuffer.removeAll()
         currentSign = .none
-        holdProgress = 0
+        live.holdProgress = 0
     }
 
     // MARK: Обработка кадра
 
     private func process(_ frame: CameraFrame) {
         let now = CACurrentMediaTime()
-        if lastFrameTime > 0 {
-            let dt = now - lastFrameTime
-            if dt > 0 {
-                fps = fps == 0 ? 1 / dt : fps * 0.9 + (1 / dt) * 0.1
-            }
-        }
-        lastFrameTime = now
+        updateFPS(now: now)
 
         updateLight(brightness: frame.brightness, now: now)
 
@@ -245,7 +255,8 @@ final class GestureViewModel: ObservableObject {
                 HandSample(points: hand.points.map { point in
                                point.x < 0 ? CGPoint(x: -1, y: -1) : layer.layerPointConverted(fromCaptureDevicePoint: point)
                            },
-                           confidence: hand.confidence)
+                           confidence: hand.confidence,
+                           chirality: hand.chirality)
             }
         }
         samples = smoother.smooth(samples, time: now)
@@ -253,7 +264,7 @@ final class GestureViewModel: ObservableObject {
         // Для рисования скелета — только уверенно найденные точки.
         let screenHands = samples.map { $0.thresholded() }
         if handCount != screenHands.count { handCount = screenHands.count }
-        handPoints = screenHands
+        if !(screenHands.isEmpty && live.handPoints.isEmpty) { live.handPoints = screenHands }
 
         // Задняя камера видит собеседника «не в зеркале». Отражаем по горизонтали, чтобы
         // жест выглядел одинаково с обеих камер, а «влево/вправо» считались со стороны жестикулирующего.
@@ -272,7 +283,7 @@ final class GestureViewModel: ObservableObject {
             return
         case .recording:
             if let f = recordingDynamic ? motionFrame : poseFrame {
-                recordedFrames.append(f)
+                recordedFrames.append((time: now, item: f))
             }
             let elapsed = now - recordingStart
             if elapsed >= recordingDuration {
@@ -292,7 +303,7 @@ final class GestureViewModel: ObservableObject {
             if geometries.isEmpty, !phraseWords.isEmpty, now - lastHandSeenTime > phrasePause {
                 finishPhrase()
             }
-            // Жесты с движением: сравниваем последние ~2 секунды с записанными жестами.
+            // Жесты с движением: сравниваем последние 1,5–3 секунды с записанными жестами.
             if recognizeMotion(frame: motionFrame, now: now) { return }
         }
 
@@ -303,23 +314,49 @@ final class GestureViewModel: ObservableObject {
         apply(result)
     }
 
-    /// Скорость ведущей руки. Ведущая — та, что ближе к прошлому положению (чтобы не «прыгать» между руками).
+    private func updateFPS(now: Double) {
+        if lastFrameTime > 0 {
+            let dt = now - lastFrameTime
+            if dt > 0 {
+                fpsAverage = fpsAverage == 0 ? 1 / dt : fpsAverage * 0.9 + (1 / dt) * 0.1
+            }
+        }
+        lastFrameTime = now
+        // Показываем FPS два раза в секунду, а не на каждом кадре.
+        if now - lastFPSUpdate >= 0.5 {
+            lastFPSUpdate = now
+            let value = Int(fpsAverage.rounded())
+            if live.fps != value { live.fps = value }
+        }
+    }
+
+    /// Скорость ведущей руки в ладонях в секунду. Ведущая — та, что ближе к прошлому положению
+    /// (чтобы не «прыгать» между руками). Скорость считается по смещению примерно за 0,1 с:
+    /// так она меньше зависит от дрожания точек, чем смещение за один кадр.
     private func trackVelocity(_ hands: [HandSample], now: Double) -> CGVector? {
+        mainHistory.removeAll { now - $0.time > 0.4 }
         guard !hands.isEmpty else {
-            previousMain = nil
+            mainHistory.removeAll()
             return nil
         }
         let main: HandSample
-        if let previous = previousMain {
+        if let previous = mainHistory.last {
             main = hands.min { dist($0.center, previous.center) < dist($1.center, previous.center) }!
         } else {
             main = hands.max { $0.palmSize < $1.palmSize }!
         }
         let center = main.center
-        defer { previousMain = (center: center, time: now) }
-
-        guard let previous = previousMain, now - previous.time < 0.3 else { return .zero }
-        return SignMatching.velocity(from: previous.center, to: center, size: main.palmSize, dt: now - previous.time)
+        let size = main.palmSize
+        // Ведущая рука «перескочила» (другая рука, ошибка Vision) — скорость считаем заново.
+        if let previous = mainHistory.last, dist(previous.center, center) > size * 1.5 {
+            mainHistory.removeAll()
+        }
+        let reference = mainHistory.last { now - $0.time >= 0.08 }
+        mainHistory.append((time: now, center: center))
+        guard let reference, size > 0 else { return .zero }
+        let dt = CGFloat(now - reference.time)
+        return CGVector(dx: (center.x - reference.center.x) / size / dt,
+                        dy: (center.y - reference.center.y) / size / dt)
     }
 
     /// Возвращает true, если распознан жест с движением.
@@ -328,24 +365,31 @@ final class GestureViewModel: ObservableObject {
 
         if now - lastHandSeenTime > 0.5 { motionBuffer.removeAll() }
         if let frame, now >= motionCooldownUntil {
-            motionBuffer.append((time: now, features: FrameFeatures(frame)))
+            motionBuffer.append((time: now, item: FrameFeatures(frame)))
         }
-        let window = motionWindow
+        let window = library.motionWindow
         motionBuffer.removeAll { now - $0.time > window }
 
+        // Сравниваем через кадр: этого хватает при частоте последовательностей 15 кадров в секунду.
         frameCounter += 1
-        guard frameCounter % 4 == 0, motionBuffer.count >= 10 else { return false }
+        guard frameCounter % 2 == 0 else { return false }
 
-        // Берём каждый второй кадр — так же, как при подготовке записанного жеста.
-        let stream = stride(from: motionBuffer.count % 2, to: motionBuffer.count, by: 2).map { motionBuffer[$0].features }
-        guard let sign = library.classifyMotion(stream) else { return false }
+        // Кадры с равным шагом по времени — так же, как при подготовке записанного жеста.
+        var best: MotionSpotter.Match?
+        if frame != nil, motionBuffer.count >= 8 {
+            best = library.bestMotion(MotionStream(SignMatching.resample(motionBuffer)))
+        }
+        // Жест засчитывается, когда сходство перестало расти (см. `MotionSpotter`).
+        guard let id = spotter.update(best: best, time: now), let sign = library.sign(id: id) else { return false }
 
         motionBuffer.removeAll()
+        spotter.reset()
         motionCooldownUntil = now + 0.5
         recognizer.reset()
+        recognizer.latchNextSign(at: now)   // конечная поза жеста не засчитывается отдельным словом
         let recognized = Sign.custom(id: sign.id, word: sign.word)
         currentSign = recognized
-        holdProgress = 1
+        live.holdProgress = 1
         translate(recognized)
         return true
     }
@@ -372,7 +416,7 @@ final class GestureViewModel: ObservableObject {
 
     private func apply(_ result: RecognitionResult) {
         if currentSign != result.sign { currentSign = result.sign }
-        holdProgress = result.holdProgress
+        if live.holdProgress != result.holdProgress { live.holdProgress = result.holdProgress }
 
         guard let fired = result.fired else { return }
         switch mode {
@@ -497,6 +541,8 @@ final class GestureViewModel: ObservableObject {
             : ["Прямо к камере"]
         recordingSteps = pendingPrompts.count
         recordingStep = 0
+        similarWord = nil
+        recordingTooStill = false
         startNextAngle()
     }
 
@@ -522,19 +568,29 @@ final class GestureViewModel: ObservableObject {
         resetRecognition()
 
         // Оставляем кадры с тем числом рук, которое было видно чаще всего.
-        let groups = Dictionary(grouping: recordedFrames, by: { $0.handCount })
+        let groups = Dictionary(grouping: recordedFrames, by: { $0.item.handCount })
         let handCount = groups.max { $0.value.count < $1.value.count }?.key ?? 1
-        let frames = recordedFrames.filter { $0.handCount == handCount }
+        let timed = recordedFrames.filter { $0.item.handCount == handCount }
+        let frames = timed.map(\.item)
         recordedFrames = []
+        // Похожее слово проверяем по первой записи («прямо к камере»), до того как она попадёт в словарь.
+        let isFirstStep = recordingStep == 1
 
         var saved = false
         if recordingDynamic {
-            let template = SignMatching.prepareTemplate(frames)
+            let template = SignMatching.prepareTemplate(timed)
             if frames.count >= 15 && template.count >= 5 {
+                if isFirstStep {
+                    similarWord = library.similarMotion(to: template, excludingWord: recordingWord)?.word
+                    recordingTooStill = SignMatching.isMostlyStill(template)
+                }
                 library.addMotion(word: recordingWord, frames: template)
                 saved = true
             }
         } else if frames.count >= 8 {
+            if isFirstStep {
+                similarWord = library.similarPose(to: frames, excludingWord: recordingWord)?.word
+            }
             library.addPoses(word: recordingWord, frames: frames)
             saved = true
         }
@@ -554,8 +610,16 @@ final class GestureViewModel: ObservableObject {
 
     private func savedNotice(handCount: Int) {
         let hands = handCount == 2 ? "двумя руками" : "одной рукой"
-        showNotice("Жест «\(recordingWord)» \(hands) сохранён")
-        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        var text = "Жест «\(recordingWord)» \(hands) сохранён"
+        if let similarWord {
+            text += "\nОн похож на «\(similarWord)» — их можно перепутать. Лучше показать жест иначе."
+        }
+        if recordingTooStill {
+            text += "\nДвижения почти не было: для такого жеста лучше подходит тип «Поза»."
+        }
+        let warning = similarWord != nil || recordingTooStill
+        showNotice(text, duration: warning ? 5 : 3)
+        UINotificationFeedbackGenerator().notificationOccurred(similarWord == nil ? .success : .warning)
     }
 
     private func failedNotice() {
@@ -563,10 +627,10 @@ final class GestureViewModel: ObservableObject {
         UINotificationFeedbackGenerator().notificationOccurred(.error)
     }
 
-    private func showNotice(_ text: String) {
+    private func showNotice(_ text: String, duration: Double = 3) {
         notice = text
         Task {
-            try? await Task.sleep(for: .seconds(3))
+            try? await Task.sleep(for: .seconds(duration))
             if notice == text { notice = nil }
         }
     }

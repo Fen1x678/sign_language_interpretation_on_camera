@@ -19,7 +19,7 @@ struct ContentView: View {
             }
             .ignoresSafeArea()
 
-            HandOverlay(hands: vm.handPoints, isActive: vm.currentSign != .none)
+            HandOverlay(live: vm.live, isActive: vm.currentSign != .none)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
 
@@ -40,7 +40,7 @@ struct ContentView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
-                        .background(.ultraThinMaterial, in: Capsule())
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
                 Spacer()
@@ -176,12 +176,7 @@ struct ContentView: View {
             }
             .pickerStyle(.segmented)
 
-            Text("\(Int(vm.fps.rounded())) FPS · \(vm.cameraPosition == .front ? "фронт." : "задняя")")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.white)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .background(.ultraThinMaterial, in: Capsule())
+            FPSLabel(live: vm.live, isFront: vm.cameraPosition == .front)
         }
     }
 
@@ -197,17 +192,8 @@ struct ContentView: View {
 
     private var gestureBadge: some View {
         HStack(spacing: 14) {
-            ZStack {
-                Circle()
-                    .stroke(.white.opacity(0.2), lineWidth: 5)
-                Circle()
-                    .trim(from: 0, to: vm.holdProgress)
-                    .stroke(Color.green, style: StrokeStyle(lineWidth: 5, lineCap: .round))
-                    .rotationEffect(.degrees(-90))
-                Text(vm.currentSign.emoji)
-                    .font(.system(size: 28))
-            }
-            .frame(width: 58, height: 58)
+            HoldRing(live: vm.live, emoji: vm.currentSign.emoji)
+                .frame(width: 58, height: 58)
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(vm.isRecognitionEnabled ? vm.currentSign.title : "Распознавание выключено")
@@ -407,7 +393,8 @@ struct GestureHelpView: View {
                     Text("Задняя камера: наведите телефон на собеседника — перевод на экране и голосом. Фронтальная: жестикулирующий сам видит, правильно ли переведено.")
                     Text("Опустите руки на 2 секунды — фраза закончится и уйдёт в историю.")
                     Text("Разные люди: приложение сравнивает углы сгиба пальцев, а не их длину, и понимает левую руку как зеркало правой. Для лучшей точности запишите одно слово у 2–3 разных людей.")
-                    Text("Разные ракурсы: записывайте жесты «С трёх ракурсов». Кроме того, приложение само достраивает, как жест выглядит сбоку, сверху и снизу. Если палец скрыт при повороте, он учитывается слабее, а не ломает распознавание.")
+                    Text("Разные ракурсы: записывайте жесты «С трёх ракурсов». Если палец скрыт при повороте, он учитывается слабее, а не ломает распознавание.")
+                    Text("Если новый жест похож на уже записанное слово, приложение предупредит об этом после записи.")
                 }
                 .font(.footnote)
 
@@ -545,5 +532,41 @@ struct SignLibraryView: View {
                 Button("Готово") { dismiss() }
             }
         }
+    }
+}
+
+// MARK: - Индикаторы, которые меняются на каждом кадре
+
+/// Кольцо удержания статичного жеста.
+struct HoldRing: View {
+    @ObservedObject var live: LiveState
+    let emoji: String
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(.white.opacity(0.2), lineWidth: 5)
+            Circle()
+                .trim(from: 0, to: live.holdProgress)
+                .stroke(Color.green, style: StrokeStyle(lineWidth: 5, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+            Text(emoji)
+                .font(.system(size: 28))
+        }
+    }
+}
+
+/// Частота обработки кадров и текущая камера.
+struct FPSLabel: View {
+    @ObservedObject var live: LiveState
+    let isFront: Bool
+
+    var body: some View {
+        Text("\(live.fps) FPS · \(isFront ? "фронт." : "задняя")")
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.white)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(.ultraThinMaterial, in: Capsule())
     }
 }

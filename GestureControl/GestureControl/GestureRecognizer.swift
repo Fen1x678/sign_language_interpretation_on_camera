@@ -135,6 +135,7 @@ struct GestureRecognizer {
     private var candidateLastSeen: Double = 0
     private var latched: Sign = .none
     private var latchedLastSeen: Double = 0
+    private var latchNextUntil: Double?
     private var cooldownUntil: Double = 0
     private var lastHandCount = 0
 
@@ -144,6 +145,14 @@ struct GestureRecognizer {
         handAppearedAt = nil
         candidate = .none
         latched = .none
+        latchNextUntil = nil
+    }
+
+    /// После жеста с движением рука ещё какое-то время стоит в конечной позе.
+    /// Эта поза не должна засчитываться как отдельное слово, поэтому первая распознанная
+    /// поза (в течение 0,6 с) считается уже сработавшей.
+    mutating func latchNextSign(at time: Double) {
+        latchNextUntil = time + 0.6
     }
 
     /// - Parameters:
@@ -206,6 +215,16 @@ struct GestureRecognizer {
 
         // 2. Статические жесты.
         let current = classify(geometries)
+
+        if let until = latchNextUntil {
+            if time > until {
+                latchNextUntil = nil
+            } else if current != .none {
+                latchNextUntil = nil
+                latched = current
+                latchedLastSeen = time
+            }
+        }
 
         if latched != .none {
             if current == latched {

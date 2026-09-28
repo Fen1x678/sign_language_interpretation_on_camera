@@ -28,8 +28,9 @@ struct CameraPreview: UIViewRepresentable {
 }
 
 /// Скелет кистей (одной или двух) поверх изображения: ключевые точки и соединения между ними.
+/// Следит только за `LiveState`, поэтому на каждом кадре перерисовывается только он.
 struct HandOverlay: View {
-    let hands: [[CGPoint]]
+    @ObservedObject var live: LiveState
     let isActive: Bool
 
     private static let bones: [(Int, Int)] = [
@@ -42,7 +43,7 @@ struct HandOverlay: View {
     ]
 
     var body: some View {
-        let allHands = hands
+        let allHands = live.handPoints
         let bones = Self.bones
         let color: Color = isActive ? .green : .yellow
 
