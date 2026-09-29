@@ -215,7 +215,8 @@ private struct PhraseRow: View, Equatable {
     }
 }
 
-/// Индикатор громкости и что сейчас происходит. Обновляется отдельно от текста.
+/// Индикатор громкости (зелёный — звук похож на голос) и что сейчас происходит.
+/// Обновляется отдельно от текста.
 private struct ListeningStatus: View {
     @ObservedObject var meter: SpeechMeter
     let isListening: Bool
@@ -247,7 +248,7 @@ private struct ListeningStatus: View {
     private var status: String {
         guard isListening else { return "Пауза — нажмите на микрофон" }
         if let notice { return notice }
-        return meter.hearsVoice ? "Слышу речь…" : "Жду речь. Новая строка — после паузы в разговоре"
+        return "Слушаю. Новая строка — после паузы в разговоре"
     }
 }
 
