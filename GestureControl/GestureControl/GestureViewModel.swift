@@ -1,6 +1,7 @@
 import SwiftUI
 import Combine
 import AVFoundation
+import CallKit
 import ImageIO
 import UIKit
 
@@ -109,6 +110,9 @@ final class GestureViewModel: ObservableObject {
     private var savedScreenBrightness: CGFloat?
     /// Приложение на экране и активно (не свёрнуто, не открыт пункт управления или переключатель приложений).
     private var isAppActive = true
+    /// Идёт ли звонок (телефон или мессенджер через CallKit). Только сам факт звонка.
+    private let callObserver = CXCallObserver()
+    private var openedSpeechForCall: UUID?
     /// Камера остановлена, пока открыта страница «Речь → текст».
     private(set) var isCameraPaused = false
     /// Ниже этой яркости (шкала APEX) сцена считается тёмной.
@@ -259,6 +263,15 @@ final class GestureViewModel: ObservableObject {
             isAppActive = false
             setLight(false)
         }
+    }
+
+    /// Приложение открыли во время звонка — один раз за звонок сразу показываем «Речь → текст».
+    func shouldOpenSpeechForCall() -> Bool {
+        guard recording == .idle,
+              let call = callObserver.calls.first(where: { $0.hasConnected && !$0.hasEnded }),
+              openedSpeechForCall != call.uuid else { return false }
+        openedSpeechForCall = call.uuid
+        return true
     }
 
     /// Камера не нужна, пока открыта страница «Речь → текст»: останавливаем её и подсветку

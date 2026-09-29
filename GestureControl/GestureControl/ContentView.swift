@@ -66,8 +66,10 @@ struct ContentView: View {
         .animation(.snappy, value: vm.notice)
         .preferredColorScheme(.dark)
         .task { await vm.start() }
+        .onAppear { openSpeechIfOnCall() }
         .onChange(of: scenePhase) { _, phase in
             vm.scenePhaseChanged(phase)
+            if phase == .active { openSpeechIfOnCall() }
         }
         .sheet(isPresented: $showHelp) { GestureHelpView() }
         .fullScreenCover(isPresented: $showSpeech) {
@@ -81,6 +83,12 @@ struct ContentView: View {
                 vm.startRecording(word: word, dynamic: dynamic, multiAngle: multiAngle)
             }
         }
+    }
+
+    /// Во время звонка приложение открыли, чтобы видеть разговор текстом.
+    private func openSpeechIfOnCall() {
+        guard !showSpeech, !showLibrary, !showHelp, vm.shouldOpenSpeechForCall() else { return }
+        showSpeech = true
     }
 
     // MARK: Запись нового жеста

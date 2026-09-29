@@ -46,6 +46,8 @@ private final class AudioSink: @unchecked Sendable {
         var noise: Float
         /// Секунд с последнего звука голоса.
         var silence: TimeInterval
+        /// Секунд с последнего настоящего звука (не цифровой тишины из одних нулей).
+        var soundSilence: TimeInterval
 
         /// Для индикатора: 0…1, громкость от −65 до −15 дБ.
         var meterLevel: Double { Double(min(max((level + 65) / 50, 0), 1)) }
@@ -73,6 +75,7 @@ private final class AudioSink: @unchecked Sendable {
     private var minima: [Float] = []
     private var loudTime: TimeInterval = 0
     private var lastVoice: TimeInterval = 0
+    private var lastSound: TimeInterval = 0
 
     /// Новый запрос распознавания (nil — запроса пока нет). Запас звука сразу уходит в него.
     func set(_ request: SFSpeechAudioBufferRecognitionRequest?) {
@@ -101,6 +104,7 @@ private final class AudioSink: @unchecked Sendable {
         minima.removeAll()
         loudTime = 0
         lastVoice = 0
+        lastSound = 0
     }
 
     func append(_ buffer: AVAudioPCMBuffer) {
@@ -129,11 +133,17 @@ private final class AudioSink: @unchecked Sendable {
         defer { lock.unlock() }
         let now = ProcessInfo.processInfo.systemUptime
         return Snapshot(level: level, noise: noise,
-                        silence: lastVoice > 0 ? now - lastVoice : .infinity)
+                        silence: lastVoice > 0 ? now - lastVoice : .infinity,
+                        soundSilence: lastSound > 0 ? now - lastSound : .infinity)
     }
 
     private func analyze(_ decibels: Float?, seconds: TimeInterval, now: TimeInterval) {
-        guard let decibels else { return }   // громкость не узнать (необычный формат звука)
+        guard let decibels else {
+            lastSound = now   // громкость не узнать (необычный формат звука) — считаем, что звук есть
+            return
+        }
+        // Даже в тихой комнате микрофон слышит шум громче −110 дБ; ниже — это нули (звук не отдают).
+        if decibels > -110 { lastSound = now }
         if hasLevel {
             // Сглаживание ~0,1 с независимо от размера буфера.
             level += (decibels - level) * Float(1 - exp(-seconds / 0.1))
@@ -250,8 +260,11 @@ final class VoiceTranslator: ObservableObject {
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "ru-RU"))
     private let audioEngine = AVAudioEngine()
     private let sink = AudioSink()
-    /// Только чтобы узнать, идёт ли звонок: ни звук, ни номер звонящего iOS приложениям не даёт.
+    /// Только чтобы узнать, идёт ли звонок. Номер звонящего iOS приложениям не даёт.
     private let callObserver = CXCallObserver()
+    /// Микрофон включён во время звонка (совместный режим, звонок не прерывается).
+    private var callMode = false
+    private var callModeStart = Date()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var generation = 0
     private var phraseStart = Date()
@@ -280,7 +293,10 @@ final class VoiceTranslator: ObservableObject {
     private static let wordsKey = "speechCustomWords"
     private static let offlineNotice = "Нет связи с сервером — распознаю на телефоне"
     private static let busyNotice = "Пауза: микрофон занят другим приложением. Продолжу автоматически."
-    private static let callNotice = "Идёт звонок. iPhone не даёт приложениям слушать телефонные разговоры — перевод продолжится после звонка."
+    private static let callStartNotice = "Идёт звонок — пробую слушать разговор…"
+    private static let callListeningNotice = "Звонок: слушаю. Включите громкую связь, чтобы телефон слышал и собеседника."
+    private static let callSilentNotice = "Во время звонка iPhone отдаёт приложению тишину вместо звука — так он защищает разговоры. Перевод продолжится после звонка."
+    private static let callBlockedNotice = "Во время звонка iPhone не дал приложению микрофон — так он защищает разговоры. Перевод продолжится после звонка."
 
     init() {
         let defaults = UserDefaults.standard
@@ -368,9 +384,16 @@ final class VoiceTranslator: ObservableObject {
         guard isListening, !running else { return }
         guard UIApplication.shared.applicationState != .background else { return }
         lastAudioRestart = Date()
+        let onCall = isOnCall
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.record, mode: .measurement, options: [.duckOthers])
+            if onCall {
+                // Во время звонка — совместный режим: он не прерывает звонок. Даст ли iPhone
+                // микрофон (и настоящий звук, а не тишину) — решает система; итог видно на экране.
+                try session.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers])
+            } else {
+                try session.setCategory(.record, mode: .measurement, options: [.duckOthers])
+            }
             try session.setActive(true, options: .notifyOthersOnDeactivation)
 
             let input = audioEngine.inputNode
@@ -389,8 +412,12 @@ final class VoiceTranslator: ObservableObject {
             try audioEngine.start()
         } catch {
             audioEngine.inputNode.removeTap(onBus: 0)
-            if automatic {
-                // Микрофон ещё занят (например, идёт звонок) — пробуем снова чуть позже.
+            if onCall {
+                // Во время звонка iPhone не дал микрофон — пробуем ещё, а после звонка всё заработает.
+                setNotice(Self.callBlockedNotice + " (код: \((error as NSError).code))")
+                scheduleResume(after: 3)
+            } else if automatic {
+                // Микрофон ещё занят другим приложением — пробуем снова чуть позже.
                 setNotice(pauseNotice)
                 scheduleResume(after: 2)
             } else {
@@ -400,7 +427,9 @@ final class VoiceTranslator: ObservableObject {
             return
         }
         running = true
-        setNotice(nil)
+        callMode = onCall
+        callModeStart = Date()
+        setNotice(onCall ? Self.callStartNotice : nil)
         beginPhrase()
         startMonitor()
     }
@@ -415,6 +444,7 @@ final class VoiceTranslator: ObservableObject {
             audioEngine.inputNode.removeTap(onBus: 0)
             running = false
         }
+        callMode = false
         sink.reset()
         meter.update(level: 0, hearsVoice: false)
     }
@@ -484,7 +514,12 @@ final class VoiceTranslator: ObservableObject {
 
     /// Почему пауза: телефонный звонок или микрофон занят другим приложением.
     private var pauseNotice: String {
-        callObserver.calls.contains(where: { !$0.hasEnded }) ? Self.callNotice : Self.busyNotice
+        isOnCall ? Self.callStartNotice : Self.busyNotice
+    }
+
+    /// Идёт телефонный звонок (или звонок в мессенджере через CallKit).
+    private var isOnCall: Bool {
+        callObserver.calls.contains(where: { !$0.hasEnded })
     }
 
     private func audioConfigurationChanged() {
@@ -518,7 +553,7 @@ final class VoiceTranslator: ObservableObject {
         request.contextualStrings = Array(vocabulary.prefix(100))
         let onDevice = useOnDevice(recognizer)
         if onDevice { request.requiresOnDeviceRecognition = true }
-        setNotice(onDevice && !onDeviceOnly ? Self.offlineNotice : nil)
+        if !callMode { setNotice(onDevice && !onDeviceOnly ? Self.offlineNotice : nil) }
 
         self.request = request
         phraseStart = Date()
@@ -657,6 +692,16 @@ final class VoiceTranslator: ObservableObject {
         let audio = sink.snapshot()
         let hearsVoice = audio.silence < voiceHold
         meter.update(level: audio.meterLevel, hearsVoice: hearsVoice)
+
+        if callMode {
+            if !isOnCall {
+                // Звонок закончился — обычный режим микрофона.
+                restartAudio()
+                return
+            }
+            let heardNothing = audio.soundSilence >= 3 && now.timeIntervalSince(callModeStart) >= 3
+            setNotice(heardNothing ? Self.callSilentNotice : Self.callListeningNotice)
+        }
 
         for (id, ended) in endedPhrases where now.timeIntervalSince(ended) > finalTimeout {
             finalize(id)
