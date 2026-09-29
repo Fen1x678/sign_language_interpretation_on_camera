@@ -237,6 +237,8 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = GestureControl;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Камера нужна для распознавания жестов";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Микрофон нужен для голосового перевода: речь превращается в текст на экране";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Распознавание речи нужно, чтобы показывать текстом, что говорят вокруг";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -264,6 +266,8 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = GestureControl;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Камера нужна для распознавания жестов";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Микрофон нужен для голосового перевода: речь превращается в текст на экране";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Распознавание речи нужно, чтобы показывать текстом, что говорят вокруг";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

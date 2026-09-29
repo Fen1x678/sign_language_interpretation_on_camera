@@ -8,6 +8,7 @@ struct ContentView: View {
     @StateObject private var vm = GestureViewModel()
     @State private var showHelp = false
     @State private var showLibrary = false
+    @State private var showSpeech = false
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -69,6 +70,12 @@ struct ContentView: View {
             vm.scenePhaseChanged(phase)
         }
         .sheet(isPresented: $showHelp) { GestureHelpView() }
+        .fullScreenCover(isPresented: $showSpeech) {
+            SpeechView(dictionaryWords: vm.library.signs.map(\.word))
+        }
+        .onChange(of: showSpeech) { _, shown in
+            vm.setCameraPaused(shown)
+        }
         .sheet(isPresented: $showLibrary) {
             SignLibraryView(library: vm.library) { word, dynamic, multiAngle in
                 vm.startRecording(word: word, dynamic: dynamic, multiAngle: multiAngle)
@@ -237,8 +244,13 @@ struct ContentView: View {
     private var translationPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Label("Перевод", systemImage: "character.bubble")
-                    .font(.headline)
+                // Голосовой перевод: речь людей вокруг → текст на отдельной странице.
+                Button {
+                    showSpeech = true
+                } label: {
+                    Label("Речь → текст", systemImage: "mic.fill")
+                        .font(.subheadline.weight(.semibold))
+                }
                 Spacer()
                 Button {
                     showLibrary = true
@@ -407,6 +419,12 @@ struct GestureHelpView: View {
                     Text("Если новый жест похож на уже записанное слово, приложение предупредит об этом после записи.")
                     Text("Подсказка «Похоже на «слово» — N%»: 100% — жест достаточно похож, чтобы засчитаться. Если процент держится ниже, сдвиньте «Чувствительность» вправо или запишите слово ещё раз — лучше тем же человеком и при том же свете. Для жестов с движением в скобках бывает причина отказа: «мало движения» — покажите с тем же размахом, что при записи; «слишком быстро» — медленнее.")
                     Text("Плечи: приложение само находит плечи на каждом кадре (линия между плечами) и учитывает, где руки относительно тела. Чтобы это работало, в кадре должны быть видны плечи. Отключить — «Словарь» → «Учитывать плечи».")
+                }
+                .font(.footnote)
+
+                Section("Речь → текст") {
+                    Text("Кнопка «Речь → текст» в панели перевода открывает голосовой перевод: всё, что говорят вокруг, сразу появляется на экране крупным текстом. Когда говорят несколько человек, каждая реплика после паузы — с новой строки.")
+                    Text("Запинки, повторы и звуки-паузы («э-э») убираются. Имена и редкие слова добавьте в «Мои слова» (кнопка «…») — тогда они распознаются точнее и исправляются, если распознаны с ошибкой.")
                 }
                 .font(.footnote)
 

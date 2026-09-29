@@ -107,6 +107,10 @@ final class GestureViewModel: ObservableObject {
     private var lastAutoOffAt: Double = -100
     private var offMargin: Double = 2.0
     private var savedScreenBrightness: CGFloat?
+    /// Приложение на экране и активно (не свёрнуто, не открыт пункт управления или переключатель приложений).
+    private var isAppActive = true
+    /// Камера остановлена, пока открыта страница «Речь → текст».
+    private(set) var isCameraPaused = false
     /// Ниже этой яркости (шкала APEX) сцена считается тёмной.
     private let darkLevel: Double = -1.0
 
@@ -243,14 +247,37 @@ final class GestureViewModel: ObservableObject {
     }
 
     /// Приложение свёрнуто или снова открыто.
+    /// Как только приложение перестаёт быть активным (выход на главный экран, переключение приложений,
+    /// пункт управления, закрытие), подсветка выключается и яркость экрана возвращается к прежней —
+    /// как в других приложениях. Делать это нужно сразу: когда приложение уже в фоне, менять яркость поздно.
     func scenePhaseChanged(_ phase: ScenePhase) {
         switch phase {
         case .active:
-            if lightMode == .on { setLight(true) }
-        case .background:
-            setLight(false)
+            isAppActive = true
+            if lightMode == .on && !isCameraPaused { setLight(true) }
         default:
-            break
+            isAppActive = false
+            setLight(false)
+        }
+    }
+
+    /// Камера не нужна, пока открыта страница «Речь → текст»: останавливаем её и подсветку
+    /// (яркость экрана возвращается к прежней), а при возврате — включаем снова.
+    func setCameraPaused(_ paused: Bool) {
+        guard paused != isCameraPaused else { return }
+        isCameraPaused = paused
+        if paused {
+            setLight(false)
+            camera.stopRunning()
+            resetRecognition()
+            live.handPoints = []
+            live.shoulders = []
+            if handCount != 0 { handCount = 0 }
+        } else {
+            // Страница речи переключала звук на запись — возвращаем озвучку перевода.
+            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
+            if started && cameraError == nil { camera.startRunning() }
+            if lightMode == .on && isAppActive { setLight(true) }
         }
     }
 
@@ -610,7 +637,8 @@ final class GestureViewModel: ObservableObject {
         let smoothed = sceneBrightness.map { $0 * 0.9 + brightness * 0.1 } ?? brightness
         sceneBrightness = smoothed
 
-        guard lightMode == .auto, recording == .idle, now - lightChangedAt > 2 else { return }
+        guard lightMode == .auto, recording == .idle, isAppActive, !isCameraPaused,
+              now - lightChangedAt > 2 else { return }
 
         if !isLightOn {
             brightSince = nil
