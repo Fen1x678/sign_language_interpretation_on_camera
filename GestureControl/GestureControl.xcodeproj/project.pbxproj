@@ -232,10 +232,11 @@
 		AA000000000000000000000E /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = GestureControl;
+				INFOPLIST_KEY_CFBundleDisplayName = speech;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Камера нужна для распознавания жестов";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Микрофон нужен для голосового перевода: речь превращается в текст на экране";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Распознавание речи нужно, чтобы показывать текстом, что говорят вокруг";
@@ -261,10 +262,11 @@
 		AA000000000000000000000F /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = GestureControl;
+				INFOPLIST_KEY_CFBundleDisplayName = speech;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Камера нужна для распознавания жестов";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Микрофон нужен для голосового перевода: речь превращается в текст на экране";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Распознавание речи нужно, чтобы показывать текстом, что говорят вокруг";

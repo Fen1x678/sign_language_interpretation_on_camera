@@ -2,6 +2,7 @@ import Foundation
 import Speech
 import AVFoundation
 import Accelerate
+import CallKit
 import UIKit
 
 /// Фраза распознанной речи. Новая фраза начинается после паузы в разговоре —
@@ -249,6 +250,8 @@ final class VoiceTranslator: ObservableObject {
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "ru-RU"))
     private let audioEngine = AVAudioEngine()
     private let sink = AudioSink()
+    /// Только чтобы узнать, идёт ли звонок: ни звук, ни номер звонящего iOS приложениям не даёт.
+    private let callObserver = CXCallObserver()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var generation = 0
     private var phraseStart = Date()
@@ -276,7 +279,8 @@ final class VoiceTranslator: ObservableObject {
     private static let onDeviceKey = "speechOnDeviceOnly"
     private static let wordsKey = "speechCustomWords"
     private static let offlineNotice = "Нет связи с сервером — распознаю на телефоне"
-    private static let busyNotice = "Пауза: микрофон занят (звонок или другое приложение). Продолжу автоматически."
+    private static let busyNotice = "Пауза: микрофон занят другим приложением. Продолжу автоматически."
+    private static let callNotice = "Идёт звонок. iPhone не даёт приложениям слушать телефонные разговоры — перевод продолжится после звонка."
 
     init() {
         let defaults = UserDefaults.standard
@@ -316,11 +320,11 @@ final class VoiceTranslator: ObservableObject {
             return
         }
         guard await Self.requestSpeechPermission() == .authorized else {
-            error = "Нет доступа к распознаванию речи. Разрешите его: Настройки → GestureControl → Распознавание речи."
+            error = "Нет доступа к распознаванию речи. Разрешите его: Настройки → speech → Распознавание речи."
             return
         }
         guard await AVAudioApplication.requestRecordPermission() else {
-            error = "Нет доступа к микрофону. Разрешите его: Настройки → GestureControl → Микрофон."
+            error = "Нет доступа к микрофону. Разрешите его: Настройки → speech → Микрофон."
             return
         }
         // Пока спрашивали разрешения, страницу могли закрыть.
@@ -387,7 +391,7 @@ final class VoiceTranslator: ObservableObject {
             audioEngine.inputNode.removeTap(onBus: 0)
             if automatic {
                 // Микрофон ещё занят (например, идёт звонок) — пробуем снова чуть позже.
-                setNotice(Self.busyNotice)
+                setNotice(pauseNotice)
                 scheduleResume(after: 2)
             } else {
                 stop()
@@ -470,12 +474,17 @@ final class VoiceTranslator: ObservableObject {
         guard isListening else { return }
         if began {
             suspendAudio()
-            setNotice(Self.busyNotice)
+            setNotice(pauseNotice)
             // Сообщение о конце перерыва приходит не всегда — время от времени пробуем сами.
             scheduleResume(after: 3)
         } else {
             scheduleResume(after: 0.4)
         }
+    }
+
+    /// Почему пауза: телефонный звонок или микрофон занят другим приложением.
+    private var pauseNotice: String {
+        callObserver.calls.contains(where: { !$0.hasEnded }) ? Self.callNotice : Self.busyNotice
     }
 
     private func audioConfigurationChanged() {

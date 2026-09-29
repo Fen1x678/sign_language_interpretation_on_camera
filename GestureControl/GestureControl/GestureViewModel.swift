@@ -205,7 +205,7 @@ final class GestureViewModel: ObservableObject {
 
         let granted = await AVCaptureDevice.requestAccess(for: .video)
         guard granted else {
-            cameraError = "Нет доступа к камере. Разрешите его: Настройки → GestureControl → Камера."
+            cameraError = "Нет доступа к камере. Разрешите его: Настройки → speech → Камера."
             return
         }
 
