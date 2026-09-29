@@ -23,12 +23,19 @@ enum CameraError: LocalizedError {
 /// chirality — какая это рука по оценке Vision: +1 правая, −1 левая, 0 — неизвестно.
 typealias CameraHand = (points: [CGPoint], confidence: [Float], chirality: Int)
 
+/// Плечи человека на кадре: две точки в координатах камеры (0…1, начало — левый верхний угол), как у рук.
+struct CameraBody {
+    var shoulders: [CGPoint]
+}
+
 /// Кадр, обработанный камерой:
 /// • hands — найденные руки (до двух);
 /// • brightness — яркость сцены по данным камеры (EXIF BrightnessValue, шкала APEX):
 ///   примерно −3 и ниже — темно, 0 — полумрак, 2…5 — комната со светом, 7+ — улица днём.
-///   NaN — камера не сообщила яркость.
-typealias CameraFrame = (hands: [CameraHand], brightness: Double)
+///   NaN — камера не сообщила яркость;
+/// • body — плечи, если на этом кадре их искали и нашли;
+/// • bodyChecked — искали ли плечи на этом кадре (их ищут через кадр).
+typealias CameraFrame = (hands: [CameraHand], brightness: Double, body: CameraBody?, bodyChecked: Bool)
 
 /// Блоки структурной схемы: «Камера → Получение видеокадров → Обнаружение руки → Определение ключевых точек».
 final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
@@ -55,6 +62,14 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         return request
     }()
     private var isConfigured = false
+
+    /// Поиск плеч (Apple Vision, `VNDetectHumanBodyPoseRequest`). Запрос переиспользуется (только на videoQueue).
+    private let bodyPoseRequest = VNDetectHumanBodyPoseRequest()
+    private var frameIndex = 0
+    private let bodyLock = NSLock()
+    private var bodyTrackingEnabled = true
+    /// Как повернуть кадр, чтобы человек на нём стоял прямо. nil — пока неизвестно.
+    private var bodyOrientation: CGImagePropertyOrientation?
 
     override init() {
         // Храним только самый свежий кадр: если обработка не успевает, старые кадры отбрасываются.
@@ -164,6 +179,16 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         }
     }
 
+    /// Настройка поиска плеч (вызывается с главного потока).
+    /// - Parameter orientation: как повернуть кадр камеры, чтобы человек стоял прямо — так же, как на экране.
+    ///   Кисть Vision находит под любым углом, а тело — только в правильной ориентации.
+    func configureBodyTracking(enabled: Bool, orientation: CGImagePropertyOrientation?) {
+        bodyLock.lock()
+        bodyTrackingEnabled = enabled
+        bodyOrientation = orientation
+        bodyLock.unlock()
+    }
+
     // MARK: - Обработка кадра (фоновая очередь)
 
     nonisolated func captureOutput(_ output: AVCaptureOutput,
@@ -176,13 +201,25 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             brightness = value
         }
 
+        // Плечи двигаются медленно: ищем их через кадр, чтобы не снижать частоту кадров.
+        frameIndex += 1
+        bodyLock.lock()
+        let orientation = bodyTrackingEnabled ? bodyOrientation : nil
+        bodyLock.unlock()
+        var body: CameraBody?
+        var bodyChecked = false
+        if let orientation, frameIndex % 2 == 0 {
+            bodyChecked = true
+            body = detectBody(in: sampleBuffer, orientation: orientation)
+        }
+
         let request = handPoseRequest
 
         let handler = VNImageRequestHandler(cmSampleBuffer: sampleBuffer, orientation: .up, options: [:])
         do {
             try handler.perform([request])
             guard let observations = request.results, !observations.isEmpty else {
-                continuation.yield((hands: [], brightness: brightness))   // рук нет в кадре
+                continuation.yield((hands: [], brightness: brightness, body: body, bodyChecked: bodyChecked))   // рук нет в кадре
                 return
             }
 
@@ -219,9 +256,42 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 }
                 hands.append((points: points, confidence: confidence, chirality: chirality))
             }
-            continuation.yield((hands: hands, brightness: brightness))
+            continuation.yield((hands: hands, brightness: brightness, body: body, bodyChecked: bodyChecked))
         } catch {
-            continuation.yield((hands: [], brightness: brightness))
+            continuation.yield((hands: [], brightness: brightness, body: body, bodyChecked: bodyChecked))
+        }
+    }
+
+    /// Плечи ближайшего к камере человека (у кого расстояние между плечами больше).
+    private func detectBody(in sampleBuffer: CMSampleBuffer, orientation: CGImagePropertyOrientation) -> CameraBody? {
+        let handler = VNImageRequestHandler(cmSampleBuffer: sampleBuffer, orientation: orientation, options: [:])
+        guard (try? handler.perform([bodyPoseRequest])) != nil,
+              let observations = bodyPoseRequest.results else { return nil }
+        var best: CameraBody?
+        var bestWidth: CGFloat = 0
+        for observation in observations {
+            guard let left = try? observation.recognizedPoint(.leftShoulder),
+                  let right = try? observation.recognizedPoint(.rightShoulder),
+                  left.confidence > 0.3, right.confidence > 0.3 else { continue }
+            let a = Self.devicePoint(left.location, orientation: orientation)
+            let b = Self.devicePoint(right.location, orientation: orientation)
+            let width = hypot(a.x - b.x, a.y - b.y)
+            if width > bestWidth {
+                bestWidth = width
+                best = CameraBody(shoulders: [a, b])
+            }
+        }
+        return best
+    }
+
+    /// Точка Vision (0…1, начало внизу слева, в повёрнутом кадре) → координаты камеры
+    /// (0…1, начало вверху слева, кадр в том виде, в каком его отдаёт камера).
+    static func devicePoint(_ p: CGPoint, orientation: CGImagePropertyOrientation) -> CGPoint {
+        switch orientation {
+        case .right: return CGPoint(x: 1 - p.y, y: 1 - p.x)   // кадр повёрнут на 90° по часовой
+        case .left:  return CGPoint(x: p.y, y: p.x)           // на 90° против часовой
+        case .down:  return CGPoint(x: 1 - p.x, y: p.y)       // на 180°
+        default:     return CGPoint(x: p.x, y: 1 - p.y)
         }
     }
 }

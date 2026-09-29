@@ -160,6 +160,21 @@ struct HandPose: Codable, Equatable {
     }
 }
 
+/// Плечи на кадре (в тех же координатах экрана, что и руки): середина между плечами
+/// и расстояние между ними. Относительно плеч считается, где находятся руки.
+struct BodyReference {
+    var center: CGPoint
+    var width: CGFloat
+
+    init?(shoulders: [CGPoint]) {
+        guard shoulders.count == 2 else { return nil }
+        let a = shoulders[0], b = shoulders[1]
+        width = dist(a, b)
+        guard width > 10 else { return nil }
+        center = CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
+    }
+}
+
 /// Один кадр жеста: одна или две руки, их взаимное положение и движение.
 struct SignFrame: Codable, Equatable {
     /// Руки слева направо (как на экране).
@@ -170,12 +185,16 @@ struct SignFrame: Codable, Equatable {
     var velocity: [Float]
     /// Скорость ведущей руки [vx, vy] в ладонях в секунду. nil — запись прошлой версии.
     var rawVelocity: [Float]?
+    /// Где находится каждая рука относительно плеч [x0, y0, x1, y1]: центр ладони относительно
+    /// середины между плечами, в расстояниях между плечами. nil — плечи не были видны.
+    var locations: [Float]?
 
     var handCount: Int { hands.count }
 
     /// Кадр из найденных рук. Учитываются только пригодные руки (см. `HandSample.isUsable`).
     /// `velocity` — скорость ведущей руки в ладонях в секунду (для жестов с движением).
-    static func make(from samples: [HandSample], velocity: CGVector? = nil) -> SignFrame? {
+    /// `body` — плечи, если они видны: тогда запоминается и положение рук относительно тела.
+    static func make(from samples: [HandSample], velocity: CGVector? = nil, body: BodyReference? = nil) -> SignFrame? {
         let usable = samples.filter(\.isUsable)
         guard !usable.isEmpty else { return nil }
         // Две самые крупные (ближние) руки, слева направо.
@@ -200,13 +219,20 @@ struct SignFrame: Codable, Equatable {
             relative = [Float((chosen[1].center.x - chosen[0].center.x) / scale),
                         Float((chosen[1].center.y - chosen[0].center.y) / scale)]
         }
-        guard let velocity else {
-            return SignFrame(hands: hands, relative: relative, velocity: [])
+        var frame = SignFrame(hands: hands, relative: relative, velocity: [])
+        if let velocity {
+            let scale = max((velocity.dx * velocity.dx + velocity.dy * velocity.dy).squareRoot(), 1.5)
+            frame.velocity = [Float(velocity.dx / scale), Float(velocity.dy / scale)]
+            frame.rawVelocity = [Float(velocity.dx), Float(velocity.dy)]
         }
-        let scale = max((velocity.dx * velocity.dx + velocity.dy * velocity.dy).squareRoot(), 1.5)
-        return SignFrame(hands: hands, relative: relative,
-                         velocity: [Float(velocity.dx / scale), Float(velocity.dy / scale)],
-                         rawVelocity: [Float(velocity.dx), Float(velocity.dy)])
+        if let body {
+            let locations: [Float] = chosen.flatMap { hand -> [Float] in
+                [Float((hand.center.x - body.center.x) / body.width),
+                 Float((hand.center.y - body.center.y) / body.width)]
+            }
+            frame.locations = locations
+        }
+        return frame
     }
 }
 
@@ -278,6 +304,12 @@ final class SignLibrary: ObservableObject {
         didSet { UserDefaults.standard.set(sensitivity, forKey: Self.sensitivityKey) }
     }
 
+    /// Искать плечи и учитывать, где находятся руки относительно тела
+    /// (у подбородка, у груди, у плеча — это разные жесты).
+    @Published var useShoulders: Bool = true {
+        didSet { UserDefaults.standard.set(useShoulders, forKey: Self.shouldersKey) }
+    }
+
     var hasDynamicSigns: Bool { signs.contains { $0.isDynamic } }
     /// Сколько секунд последних кадров сравнивать с жестами с движением
     /// (зависит от длины записанных жестов).
@@ -299,11 +331,13 @@ final class SignLibrary: ObservableObject {
     private let posesPerRecording = 20
 
     private static let sensitivityKey = "signSensitivity"
+    private static let shouldersKey = "useShoulders"
     private let fileURL = URL.documentsDirectory.appending(path: "sign_dictionary_v2.json")
 
     init() {
         let saved = UserDefaults.standard.double(forKey: Self.sensitivityKey)
         sensitivity = saved > 0 ? saved : 1.0
+        useShoulders = UserDefaults.standard.object(forKey: Self.shouldersKey) as? Bool ?? true
         load()
     }
 

@@ -1,6 +1,7 @@
 import SwiftUI
 import Combine
 import AVFoundation
+import ImageIO
 import UIKit
 
 struct DemoScreen {
@@ -24,6 +25,8 @@ final class LiveState: ObservableObject {
     /// Прогресс удержания статичного жеста, 0…1.
     @Published var holdProgress: Double = 0
     @Published var fps = 0
+    /// Плечи в координатах экрана (две точки или пусто) — для отрисовки.
+    @Published var shoulders: [CGPoint] = []
 }
 
 /// Режим подсветки.
@@ -70,6 +73,8 @@ final class GestureViewModel: ObservableObject {
     let live = LiveState()
     @Published private(set) var handCount = 0
     var isHandDetected: Bool { handCount > 0 }
+    /// Плечи найдены: положение рук относительно тела учитывается.
+    @Published private(set) var isBodyDetected = false
     @Published private(set) var currentSign: Sign = .none
     @Published private(set) var cameraError: String?
     @Published private(set) var notice: String?
@@ -113,6 +118,14 @@ final class GestureViewModel: ObservableObject {
     private var recordingTooStill = false
     private var recordingStart: Double = 0
     private var recordingDuration: Double { recordingDynamic ? 2.5 : 2.0 }
+
+    // MARK: Плечи
+    /// Плечи в координатах экрана, слева направо (сглажены). Пусто — не найдены.
+    private var shoulderPoints: [CGPoint] = []
+    private var shouldersSeenAt: Double = -.infinity
+    private var bodyTrackingConfigured = false
+    private var bodyTrackingEnabled = false
+    private var bodyOrientation: CGImagePropertyOrientation?
 
     // MARK: Движение рук
     private var smoother = HandSmoother()
@@ -200,6 +213,8 @@ final class GestureViewModel: ObservableObject {
             cameraPosition = camera.position
             live.handPoints = []
             mainHistory.removeAll()
+            shoulderPoints = []
+            bodyTrackingConfigured = false
             smoother.reset()
             sceneBrightness = nil
             resetRecognition()
@@ -271,11 +286,21 @@ final class GestureViewModel: ObservableObject {
         let recognitionSamples = cameraPosition == .back ? samples.map { $0.flipped(width: width) } : samples
         let handsForRecognition = recognitionSamples.map { $0.thresholded() }
 
+        // Плечи находятся автоматически; относительно них считается, где находятся руки.
+        let shoulders = updateShoulders(frame, now: now)
+        var body: BodyReference?
+        if shoulders.count == 2 {
+            let layerWidth = previewLayer?.bounds.width ?? 0
+            body = BodyReference(shoulders: cameraPosition == .back
+                                 ? shoulders.map { CGPoint(x: layerWidth - $0.x, y: $0.y) }
+                                 : shoulders)
+        }
+
         let geometries = handsForRecognition.compactMap { HandGeometry(points: $0) }
         if !geometries.isEmpty { lastHandSeenTime = now }
         let velocity = trackVelocity(recognitionSamples.filter { $0.palmSize > 10 }, now: now)
-        let poseFrame = SignFrame.make(from: recognitionSamples)
-        let motionFrame = velocity.flatMap { SignFrame.make(from: recognitionSamples, velocity: $0) }
+        let poseFrame = SignFrame.make(from: recognitionSamples, body: body)
+        let motionFrame = velocity.flatMap { SignFrame.make(from: recognitionSamples, velocity: $0, body: body) }
 
         // Запись нового жеста.
         switch recording {
@@ -312,6 +337,66 @@ final class GestureViewModel: ObservableObject {
             self.classifyStatic(hands, features: poseFeatures)
         }
         apply(result)
+    }
+
+    /// Плечи в координатах экрана. Их ищет камера (через кадр); здесь они сглаживаются
+    /// и удерживаются 0,6 с, если на кадре их не нашли (например, рука на мгновение закрыла плечо).
+    private func updateShoulders(_ frame: CameraFrame, now: Double) -> [CGPoint] {
+        guard let layer = previewLayer else { return [] }
+
+        // Тело Vision находит, только если человек на кадре стоит прямо. Как повернуть кадр,
+        // определяем по слою предпросмотра — так же камера показана на экране.
+        let enabled = library.useShoulders
+        let orientation = Self.uprightOrientation(of: layer)
+        if !bodyTrackingConfigured || enabled != bodyTrackingEnabled || orientation != bodyOrientation {
+            bodyTrackingConfigured = true
+            bodyTrackingEnabled = enabled
+            bodyOrientation = orientation
+            camera.configureBodyTracking(enabled: enabled, orientation: orientation)
+        }
+
+        if !enabled {
+            shoulderPoints = []
+        } else if let found = frame.body, found.shoulders.count == 2 {
+            let points = found.shoulders
+                .map { layer.layerPointConverted(fromCaptureDevicePoint: $0) }
+                .sorted { $0.x < $1.x }
+            let width = dist(points[0], points[1])
+            if shoulderPoints.count == 2, dist(shoulderPoints[0], points[0]) < width * 0.5 {
+                // Сглаживаем: плечи почти не двигаются, а точки Vision слегка дрожат.
+                shoulderPoints = zip(shoulderPoints, points).map { old, new in
+                    CGPoint(x: old.x * 0.5 + new.x * 0.5, y: old.y * 0.5 + new.y * 0.5)
+                }
+            } else {
+                shoulderPoints = points
+            }
+            shouldersSeenAt = now
+        } else if now - shouldersSeenAt > 0.6 {
+            shoulderPoints = []
+        }
+
+        if live.shoulders != shoulderPoints { live.shoulders = shoulderPoints }
+        let detected = shoulderPoints.count == 2
+        if isBodyDetected != detected { isBodyDetected = detected }
+        return shoulderPoints
+    }
+
+    /// Как повернуть кадр камеры, чтобы человек на нём стоял прямо, как на экране.
+    /// Смотрим, куда на экране уходят оси кадра: так не нужно гадать, как установлена камера.
+    private static func uprightOrientation(of layer: AVCaptureVideoPreviewLayer) -> CGImagePropertyOrientation? {
+        let o = layer.layerPointConverted(fromCaptureDevicePoint: CGPoint(x: 0.5, y: 0.5))
+        let x = layer.layerPointConverted(fromCaptureDevicePoint: CGPoint(x: 0.6, y: 0.5))
+        let y = layer.layerPointConverted(fromCaptureDevicePoint: CGPoint(x: 0.5, y: 0.6))
+        let ex = CGPoint(x: x.x - o.x, y: x.y - o.y)
+        let ey = CGPoint(x: y.x - o.x, y: y.y - o.y)
+        if abs(ex.y) > abs(ex.x) {
+            // Ось X кадра идёт по вертикали экрана: кадр повёрнут на 90°.
+            return ex.y < 0 ? .left : .right
+        }
+        if abs(ey.y) > abs(ey.x) {
+            return ey.y > 0 ? .up : .down
+        }
+        return nil   // слой ещё не готов
     }
 
     private func updateFPS(now: Double) {

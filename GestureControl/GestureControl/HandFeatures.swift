@@ -4,7 +4,7 @@ import Foundation
 
 /// Признаки кадра, почти не зависящие от размера руки, длины пальцев и расстояния до камеры.
 ///
-/// На каждую руку 31 число:
+/// На каждую руку 33 числа:
 /// • 15 углов сгиба суставов (по 3 на палец);
 /// • 4 угла между соседними пальцами (насколько пальцы разведены);
 /// • 4 расстояния от кончика большого пальца до кончиков остальных (кольца, щепоти);
@@ -12,15 +12,18 @@ import Foundation
 ///   даже если направлен прямо в камеру и углы сгиба не видны;
 /// • сторона ладони (к камере ладонью или тыльной стороной) — с учётом того, правая это рука или левая:
 ///   в 2D ладонь правой руки выглядит так же, как тыльная сторона левой;
-/// • направление кисти (куда «смотрят» пальцы), 2 числа.
+/// • направление кисти (куда «смотрят» пальцы), 2 числа;
+/// • где рука относительно плеч, 2 числа: у подбородка, у груди, у плеча — это разные жесты.
+///   Если плечи не видны на одном из сравниваемых кадров, этот признак не учитывается.
 /// Для двух рук добавляется положение правой руки относительно левой.
 ///
 /// У каждого признака есть вес. Углы сгиба в 2D шумные (палец может смотреть в камеру), поэтому
 /// их вес меньше. Если точки видны плохо (палец скрыт при повороте), признак учитывается слабее;
 /// если кость направлена в камеру и угол измерить нельзя — не учитывается совсем.
 struct FrameFeatures {
-    static let handLength = 31
+    static let handLength = 33
     static let orientX = 29
+    static let locationX = 31
 
     static let handWeights: [Float] = {
         var w: [Float] = [0.18, 0.3, 0.15]                 // большой палец: CMC, MP, IP
@@ -30,6 +33,7 @@ struct FrameFeatures {
         w += [1.5, 1.5, 1.5, 1.5, 1.5]                     // вытянутость пальцев
         w += [0.4]                                         // сторона ладони
         w += [0.6, 0.6]                                    // направление кисти
+        w += [2.5, 2.5]                                    // положение относительно плеч
         return w
     }()
 
@@ -46,8 +50,16 @@ struct FrameFeatures {
     init(_ frame: SignFrame) {
         var values: [Float] = []
         var weights: [Float] = []
-        for hand in frame.hands {
-            let (v, r) = Self.handFeatures(hand)
+        let locations = frame.locations?.count == 2 * frame.hands.count ? frame.locations : nil
+        for (h, hand) in frame.hands.enumerated() {
+            var (v, r) = Self.handFeatures(hand)
+            if let locations {
+                v += [min(max(locations[2 * h] / 1.5, -1), 1), min(max(locations[2 * h + 1] / 1.5, -1), 1)]
+                r += [1, 1]
+            } else {
+                v += [0, 0]
+                r += [0, 0]
+            }
             values += v
             weights += zip(Self.handWeights, r).map { $0 * $1 }
         }
@@ -77,6 +89,7 @@ struct FrameFeatures {
         }
         for h in 0..<handCount where (h + 1) * n <= m.values.count {
             m.values[h * n + Self.orientX] = -m.values[h * n + Self.orientX]
+            m.values[h * n + Self.locationX] = -m.values[h * n + Self.locationX]
         }
         m.chirality = chirality.reversed().map { -$0 }
         if motion.count == 2 { m.motion = [-motion[0], motion[1]] }

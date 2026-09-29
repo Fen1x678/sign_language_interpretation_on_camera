@@ -27,7 +27,7 @@ struct CameraPreview: UIViewRepresentable {
     func updateUIView(_ uiView: PreviewView, context: Context) {}
 }
 
-/// Скелет кистей (одной или двух) поверх изображения: ключевые точки и соединения между ними.
+/// Скелет кистей (одной или двух) и линия плеч поверх изображения.
 /// Следит только за `LiveState`, поэтому на каждом кадре перерисовывается только он.
 struct HandOverlay: View {
     @ObservedObject var live: LiveState
@@ -44,10 +44,22 @@ struct HandOverlay: View {
 
     var body: some View {
         let allHands = live.handPoints
+        let shoulders = live.shoulders
         let bones = Self.bones
         let color: Color = isActive ? .green : .yellow
 
         Canvas { context, _ in
+          // Плечи: линия и две точки.
+          if shoulders.count == 2 {
+            var line = Path()
+            line.move(to: shoulders[0])
+            line.addLine(to: shoulders[1])
+            context.stroke(line, with: .color(.cyan.opacity(0.7)), lineWidth: 3)
+            for point in shoulders {
+                let rect = CGRect(x: point.x - 8, y: point.y - 8, width: 16, height: 16)
+                context.fill(Path(ellipseIn: rect), with: .color(.cyan))
+            }
+          }
           for pts in allHands where pts.count == 21 {
             var path = Path()
             for (a, b) in bones where pts[a].x >= 0 && pts[b].x >= 0 {

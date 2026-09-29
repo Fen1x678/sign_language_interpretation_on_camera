@@ -121,13 +121,20 @@ struct ContentView: View {
 
     private var topBar: some View {
         HStack(spacing: 8) {
-            Label(vm.handCount >= 2 ? "Две руки" : (vm.isHandDetected ? "Рука в кадре" : "Нет руки"),
-                  systemImage: vm.isHandDetected ? "hand.raised.fill" : "hand.raised.slash")
-                .font(.footnote.weight(.semibold))
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(vm.isHandDetected ? Color.green.opacity(0.8) : Color.red.opacity(0.7),
-                            in: Capsule())
+            HStack(spacing: 6) {
+                Label(vm.handCount >= 2 ? "Две руки" : (vm.isHandDetected ? "Рука в кадре" : "Нет руки"),
+                      systemImage: vm.isHandDetected ? "hand.raised.fill" : "hand.raised.slash")
+                // Плечи найдены — учитывается, где руки относительно тела.
+                if vm.isBodyDetected {
+                    Image(systemName: "figure.stand")
+                        .accessibilityLabel("Плечи найдены")
+                }
+            }
+            .font(.footnote.weight(.semibold))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(vm.isHandDetected ? Color.green.opacity(0.8) : Color.red.opacity(0.7),
+                        in: Capsule())
 
             Spacer()
 
@@ -395,6 +402,7 @@ struct GestureHelpView: View {
                     Text("Разные люди: приложение сравнивает углы сгиба пальцев, а не их длину, и понимает левую руку как зеркало правой. Для лучшей точности запишите одно слово у 2–3 разных людей.")
                     Text("Разные ракурсы: записывайте жесты «С трёх ракурсов». Если палец скрыт при повороте, он учитывается слабее, а не ломает распознавание.")
                     Text("Если новый жест похож на уже записанное слово, приложение предупредит об этом после записи.")
+                    Text("Плечи: приложение само находит плечи (голубая линия) и учитывает, где руки относительно тела. Чтобы это работало, в кадре должны быть видны плечи. Отключить — «Словарь» → «Учитывать плечи».")
                 }
                 .font(.footnote)
 
@@ -525,6 +533,12 @@ struct SignLibraryView: View {
                     Text("Чувствительность")
                 } footer: {
                     Text("Если жесты часто не распознаются — сдвиньте вправо. Если появляются лишние слова — влево.")
+                }
+
+                Section {
+                    Toggle("Учитывать плечи", isOn: $library.useShoulders)
+                } footer: {
+                    Text("Плечи находятся автоматически (на экране — голубая линия). Тогда одна и та же форма кисти у подбородка, у груди и у плеча — разные слова. Если плечи не видны, жест распознаётся только по кистям.")
                 }
             }
             .navigationTitle("Словарь жестов")
