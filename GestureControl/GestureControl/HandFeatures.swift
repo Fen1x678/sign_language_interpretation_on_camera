@@ -136,6 +136,23 @@ struct FrameFeatures {
         return den > 0 ? (num / den).squareRoot() : .infinity
     }
 
+    /// Отличие только формы кистей — без положения относительно плеч и между руками.
+    /// Для «активности»: перемещение руки — это движение, а не смена формы.
+    static func handShapeDistance(_ a: FrameFeatures, _ b: FrameFeatures) -> Float {
+        let n = min(a.values.count, a.handCount * handLength)
+        guard a.handCount == b.handCount, a.values.count == b.values.count, n > 0 else { return .infinity }
+        var num: Float = 0
+        var den: Float = 0
+        for i in 0..<n where i % handLength < locationX {
+            let w = min(a.weights[i], b.weights[i])
+            guard w > 0 else { continue }
+            let d = a.values[i] - b.values[i]
+            num += w * d * d
+            den += w
+        }
+        return den > 0 ? (num / den).squareRoot() : .infinity
+    }
+
     /// Расстояние между кадрами жеста с движением: форма рук и направление движения.
     static func distance(_ a: FrameFeatures, _ b: FrameFeatures) -> Float {
         guard a.handCount == b.handCount, a.motion.count == 2, b.motion.count == 2 else {
@@ -330,7 +347,7 @@ enum SignMatching {
             let j = max(0, i - 2)
             var rate: Float = 0
             if i > j {
-                let d = FrameFeatures.shapeDistance(sequence[i], sequence[j])
+                let d = FrameFeatures.handShapeDistance(sequence[i], sequence[j])
                 if d.isFinite { rate = d * Float(sampleRate) / Float(i - j) }
             }
             // Меньше 0,25 в секунду — дрожание точек, а не смена формы.
@@ -412,6 +429,32 @@ enum SignMatching {
 
 // MARK: - Шаблон и поток для жестов с движением
 
+/// Почему похожий жест с движением не засчитан (для подсказки на экране).
+enum MotionRejection {
+    /// Показан больше чем в 2 раза быстрее записанного — скорее всего, это кусок другого жеста.
+    case tooFast
+    /// Рука почти не двигалась, а в записанном жесте двигалась.
+    case tooStill
+    /// Форма кисти не менялась, а в записанном жесте менялась.
+    case noShapeChange
+
+    var title: String {
+        switch self {
+        case .tooFast:       return "слишком быстро"
+        case .tooStill:      return "мало движения"
+        case .noShapeChange: return "кисть не меняет форму"
+        }
+    }
+}
+
+/// Результат сравнения шаблона с потоком кадров.
+struct MotionCost {
+    /// Стоимость DTW (меньше — похоже сильнее); бесконечность — не подходит.
+    var cost: Float = .infinity
+    /// Самый похожий вариант, отбракованный проверками, и причина — для подсказки.
+    var rejected: (cost: Float, reason: MotionRejection)?
+}
+
 /// Записанный жест с движением, подготовленный для сравнения.
 struct MotionTemplate {
     let frames: [FrameFeatures]
@@ -437,10 +480,11 @@ struct MotionTemplate {
     /// Стоимость DTW шаблона на конце потока с дополнительными проверками:
     /// • жест показан не больше чем в 2 раза быстрее записанного
     ///   (иначе кусок другого жеста, например часть круга, сойдёт за короткий жест);
-    /// • в найденном отрезке есть движение и/или смена формы, как в шаблоне
-    ///   (неподвижная рука не должна совпадать с жестом с движением).
-    func cost(on stream: MotionStream, abandonAbove: Float = .infinity) -> Float {
-        guard stream.handCount == handCount else { return .infinity }
+    /// • в найденном отрезке есть движение (или смена формы — для жестов почти без перемещения руки),
+    ///   как в шаблоне: неподвижная рука не должна совпадать с жестом с движением.
+    func cost(on stream: MotionStream, abandonAbove: Float = .infinity) -> MotionCost {
+        var result = MotionCost()
+        guard stream.handCount == handCount else { return result }
         // Если известно, какой рукой записан и показан жест, «неподходящий» вариант (обычный или зеркальный)
         // дороже: так жесты «влево» и «вправо» не путаются, а ошибка Vision с рукой не ломает распознавание.
         let known = chirality != 0 && stream.chirality != 0
@@ -450,21 +494,30 @@ struct MotionTemplate {
             ? [(stream.frames, 1), (stream.mirrored, 1)]
             : (same ? [(stream.frames, 1), (stream.mirrored, penalty)]
                     : [(stream.mirrored, 1), (stream.frames, penalty)])
-        var best = Float.infinity
         for (frames, extra) in candidates {
             let (raw, start) = SignMatching.subsequenceDTW(template: self.frames, stream: frames,
-                                                           abandonAbove: min(best, abandonAbove) / extra)
+                                                           abandonAbove: min(result.cost, abandonAbove) / extra)
             let cost = raw * extra
-            guard cost < best else { continue }
-            let segment = frames.count - start
-            if Float(segment) < 0.5 * Float(self.frames.count) { continue }
-            let speed = stream.speed[start...].reduce(0, +) / Float(segment)
-            let shape = stream.shape[start...].reduce(0, +) / Float(segment)
-            if speedActivity > 0.5 && speed < 0.4 * speedActivity { continue }
-            if shapeActivity > 0.3 && shape < 0.4 * shapeActivity { continue }
-            best = cost
+            guard cost.isFinite, cost < result.cost else { continue }
+            if let reason = rejection(start: start, streamCount: frames.count, stream: stream) {
+                if cost < (result.rejected?.cost ?? .infinity) { result.rejected = (cost, reason) }
+                continue
+            }
+            result.cost = cost
         }
-        return best
+        return result
+    }
+
+    private func rejection(start: Int, streamCount: Int, stream: MotionStream) -> MotionRejection? {
+        let segment = streamCount - start
+        if Float(segment) < 0.5 * Float(frames.count) { return .tooFast }
+        let speed = stream.speed[start...].reduce(0, +) / Float(segment)
+        let shape = stream.shape[start...].reduce(0, +) / Float(segment)
+        if speedActivity > 0.5 && speed < 0.3 * speedActivity { return .tooStill }
+        // Смену формы проверяем только у жестов, где рука почти не перемещается
+        // (у быстрых жестов «форма» дрожит от смазанного кадра и сравнивать её ненадёжно).
+        if speedActivity < 1.0 && shapeActivity > 0.3 && shape < 0.4 * shapeActivity { return .noShapeChange }
+        return nil
     }
 }
 

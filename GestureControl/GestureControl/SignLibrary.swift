@@ -381,9 +381,10 @@ final class SignLibrary: ObservableObject {
     }
     private var cache: [UUID: Cache] = [:]
 
-    /// Самое похожее слово на последних сравнениях и его расстояние относительно порога
-    /// (меньше 1 — достаточно похоже). Нужно для подсказки на экране.
-    private(set) var lastCandidate: (word: String, ratio: Float)?
+    /// Самое похожее слово на последних сравнениях, его расстояние относительно порога
+    /// (меньше 1 — достаточно похоже) и почему оно не засчитано (если отбраковано проверкой).
+    /// Нужно для подсказки на экране.
+    private(set) var lastCandidate: (word: String, ratio: Float, reason: String?)?
 
     /// Сколько кадров позы на слово брать для сравнения (остальные прореживаются).
     private let maxPoseFrames = 60
@@ -480,21 +481,28 @@ final class SignLibrary: ObservableObject {
         lastCandidate = nil
     }
 
-    private func noteCandidate(_ costs: [(sign: CustomSign, ratio: Float)]) {
-        guard let best = costs.min(by: { $0.ratio < $1.ratio }) else { return }
-        if let current = lastCandidate, current.ratio <= best.ratio { return }
-        lastCandidate = (best.sign.word, best.ratio)
+    private func noteCandidate(word: String, ratio: Float, reason: String?) {
+        guard ratio.isFinite else { return }
+        if let current = lastCandidate, current.ratio <= ratio { return }
+        lastCandidate = (word, ratio, reason)
     }
 
-    /// Поза. `sticky` — жест, который уже распознаётся: для него порог немного мягче,
+    private func noteCandidate(_ costs: [(sign: CustomSign, ratio: Float)]) {
+        guard let best = costs.min(by: { $0.ratio < $1.ratio }) else { return }
+        noteCandidate(word: best.sign.word, ratio: best.ratio, reason: nil)
+    }
+
+    /// Поза. `variants` — поза всех рук в кадре и, если рук две, каждой руки отдельно:
+    /// так жест одной рукой узнаётся, даже если в кадре видна и вторая (опущенная) рука.
+    /// `sticky` — жест, который уже распознаётся: для него порог немного мягче,
     /// чтобы распознавание не «мигало» от случайного дрожания руки.
-    func classifyPose(_ live: FrameFeatures, sticky: UUID?) -> CustomSign? {
-        let mirrored = live.mirrored()
+    func classifyPose(_ variants: [FrameFeatures], sticky: UUID?) -> CustomSign? {
+        let queries = variants.map { ($0, $0.mirrored()) }
         let scale = Float(sensitivity)
         var costs: [(sign: CustomSign, ratio: Float)] = []
         for sign in signs {
             guard let c = cache[sign.id], !c.poses.isEmpty else { continue }
-            let d = Self.poseCost(live, mirrored, c.poses)
+            let d = queries.map { Self.poseCost($0.0, $0.1, c.poses) }.min() ?? .infinity
             if d.isFinite { costs.append((sign, d / (c.poseThreshold * scale))) }
         }
         noteCandidate(costs)
@@ -502,20 +510,31 @@ final class SignLibrary: ObservableObject {
     }
 
     /// Лучший жест с движением, который заканчивается на последнем кадре потока.
+    /// `streams` — последние кадры всех рук и, если рук две, отдельно ведущей (движущейся) руки.
     /// nil — ни один жест не похож достаточно или выбор неоднозначен.
-    func bestMotion(_ stream: MotionStream) -> MotionSpotter.Match? {
-        guard stream.frames.count >= 4 else { return nil }
+    func bestMotion(_ streams: [MotionStream]) -> MotionSpotter.Match? {
+        let streams = streams.filter { $0.frames.count >= 4 }
+        guard !streams.isEmpty else { return nil }
         let scale = Float(sensitivity)
         var costs: [(sign: CustomSign, ratio: Float)] = []
         for sign in signs {
             guard let c = cache[sign.id], !c.motions.isEmpty else { continue }
             let limit = c.motionThreshold * scale
             var best = Float.infinity
+            var rejected: (cost: Float, reason: MotionRejection)?
             for template in c.motions {
-                // Если жест заведомо не подходит, DTW прекращается досрочно.
-                best = min(best, template.cost(on: stream, abandonAbove: min(best, limit * 1.3)))
+                for stream in streams where stream.handCount == template.handCount {
+                    // Если жест заведомо не подходит, DTW прекращается досрочно.
+                    let result = template.cost(on: stream, abandonAbove: min(best, limit * 2))
+                    best = min(best, result.cost)
+                    if let r = result.rejected, r.cost < (rejected?.cost ?? .infinity) { rejected = r }
+                }
             }
-            if best.isFinite { costs.append((sign, best / limit)) }
+            if best.isFinite {
+                costs.append((sign, best / limit))
+            } else if let rejected {
+                noteCandidate(word: sign.word, ratio: rejected.cost / limit, reason: rejected.reason.title)
+            }
         }
         noteCandidate(costs)
         guard let best = decide(costs, sticky: nil) else { return nil }
@@ -588,7 +607,7 @@ final class SignLibrary: ObservableObject {
             .filter { $0.id != own }
             .compactMap { sign -> (sign: CustomSign, ratio: Float)? in
                 guard let c = cache[sign.id], !c.motions.isEmpty else { return nil }
-                let cost = c.motions.map { $0.cost(on: stream) }.min() ?? .infinity
+                let cost = c.motions.map { $0.cost(on: stream).cost }.min() ?? .infinity
                 return (sign, cost / c.motionThreshold)
             }
             .filter { $0.ratio < 1 }
@@ -643,7 +662,7 @@ final class SignLibrary: ObservableObject {
         var costs: [Float] = []
         for (i, a) in templates.enumerated() {
             for (j, b) in templates.enumerated() where i != j {
-                let c = a.cost(on: MotionStream(b.frames))
+                let c = a.cost(on: MotionStream(b.frames)).cost
                 if c.isFinite { costs.append(c) }
             }
         }

@@ -29,6 +29,12 @@ final class LiveState: ObservableObject {
     @Published var shoulders: [CGPoint] = []
 }
 
+/// Кадр для жестов с движением: все руки в кадре и отдельно ведущая (движущаяся) рука.
+struct MotionSample {
+    let all: FrameFeatures
+    let main: FrameFeatures?
+}
+
 /// Режим подсветки.
 enum LightMode: String, CaseIterable, Identifiable {
     case auto, on, off
@@ -116,6 +122,10 @@ final class GestureViewModel: ObservableObject {
     @Published private(set) var recordingSteps = 1
     private var pendingPrompts: [String] = []
     private var recordedFrames: [(time: Double, item: SignFrame)] = []
+    /// Для жестов с движением: кадры только ведущей руки и скорости рук на каждом кадре —
+    /// чтобы решить, жест одной рукой или двумя.
+    private var recordedMainFrames: [(time: Double, item: SignFrame)] = []
+    private var recordedSpeeds: [(main: Double, other: Double?)] = []
     /// Похожее слово словаря, найденное при записи (предупреждаем в конце записи).
     private var similarWord: String?
     private var recordingTooStill = false
@@ -132,9 +142,11 @@ final class GestureViewModel: ObservableObject {
 
     // MARK: Движение рук
     private var smoother = HandSmoother()
-    private var motionBuffer: [(time: Double, item: FrameFeatures)] = []
-    /// Положения ведущей руки за последние доли секунды — для расчёта скорости.
-    private var mainHistory: [(time: Double, center: CGPoint)] = []
+    private var motionBuffer: [(time: Double, item: MotionSample)] = []
+    /// Центры рук за последние доли секунды — для скорости каждой руки.
+    private var centerHistory: [(time: Double, centers: [CGPoint])] = []
+    /// Где была ведущая (движущаяся) рука на прошлом кадре.
+    private var mainCenter: CGPoint?
     private var spotter = MotionSpotter()
     private var lastHandSeenTime: Double = 0
     private var frameCounter = 0
@@ -215,7 +227,8 @@ final class GestureViewModel: ObservableObject {
             try camera.switchCamera()
             cameraPosition = camera.position
             live.handPoints = []
-            mainHistory.removeAll()
+            centerHistory.removeAll()
+            mainCenter = nil
             shoulderPoints = []
             shoulderSmoother.reset()
             bodyTrackingConfigured = false
@@ -302,16 +315,38 @@ final class GestureViewModel: ObservableObject {
 
         let geometries = handsForRecognition.compactMap { HandGeometry(points: $0) }
         if !geometries.isEmpty { lastHandSeenTime = now }
-        let velocity = trackVelocity(recognitionSamples.filter { $0.palmSize > 10 }, now: now)
+        let usable = recognitionSamples.filter { $0.palmSize > 10 }
+        let motion = trackHands(usable, now: now)
+        let mainSample = motion.main.map { usable[$0] }
+        let mainVelocity = motion.main.map { motion.velocities[$0] }
         let poseFrame = SignFrame.make(from: recognitionSamples, body: body)
-        let motionFrame = velocity.flatMap { SignFrame.make(from: recognitionSamples, velocity: $0, body: body) }
+        let motionFrame = mainVelocity.flatMap { SignFrame.make(from: recognitionSamples, velocity: $0, body: body) }
+        // Если в кадре две руки, отдельно берём ведущую: жест одной рукой должен узнаваться,
+        // даже когда вторая (опущенная) рука тоже видна.
+        let mainMotionFrame: SignFrame? = motionFrame?.handCount == 2
+            ? mainSample.flatMap { SignFrame.make(from: [$0], velocity: mainVelocity, body: body) }
+            : motionFrame
+        var poseVariants: [SignFrame] = poseFrame.map { [$0] } ?? []
+        if poseFrame?.handCount == 2 {
+            poseVariants += usable.compactMap { SignFrame.make(from: [$0], body: body) }
+        }
 
         // Запись нового жеста.
         switch recording {
         case .countdown:
             return
         case .recording:
-            if let f = recordingDynamic ? motionFrame : poseFrame {
+            if recordingDynamic {
+                if let f = motionFrame {
+                    recordedFrames.append((time: now, item: f))
+                    if let m = mainMotionFrame { recordedMainFrames.append((time: now, item: m)) }
+                    if let main = motion.main {
+                        let speeds = motion.velocities.map { Double(hypot($0.dx, $0.dy)) }
+                        let other = speeds.indices.filter { $0 != main }.map { speeds[$0] }.max()
+                        recordedSpeeds.append((main: speeds[main], other: other))
+                    }
+                }
+            } else if let f = poseFrame {
                 recordedFrames.append((time: now, item: f))
             }
             let elapsed = now - recordingStart
@@ -332,18 +367,17 @@ final class GestureViewModel: ObservableObject {
         defer { updateHint(now: now) }
 
         if mode == .translate {
-            library.resetCandidate()
             // Руки опущены — фраза закончена.
             if geometries.isEmpty, !phraseWords.isEmpty, now - lastHandSeenTime > phrasePause {
                 finishPhrase()
             }
             // Жесты с движением: сравниваем последние 1,5–3 секунды с записанными жестами.
-            if recognizeMotion(frame: motionFrame, now: now) { return }
+            if recognizeMotion(frame: motionFrame, mainFrame: mainMotionFrame, now: now) { return }
         }
 
-        let poseFeatures = poseFrame.map(FrameFeatures.init)
+        let poseFeatures = poseVariants.map(FrameFeatures.init)
         let result = recognizer.process(hands: handsForRecognition, time: now) { hands in
-            self.classifyStatic(hands, features: poseFeatures)
+            self.classifyStatic(hands, variants: poseFeatures)
         }
         apply(result)
     }
@@ -353,10 +387,16 @@ final class GestureViewModel: ObservableObject {
     private func updateHint(now: Double) {
         guard now - lastHintUpdate >= 0.25 else { return }
         lastHintUpdate = now
+        // Берём самое похожее слово за последние 0,25 с и начинаем копить заново.
+        defer { library.resetCandidate() }
         var text: String?
         if mode == .translate, currentSign == .none, isHandDetected, let candidate = library.lastCandidate {
             let percent = Int((max(0, min(1, 2 - candidate.ratio)) * 100).rounded())
-            if percent >= 20 { text = "Похоже на «\(candidate.word)» — \(percent)%" }
+            if percent >= 20 {
+                var line = "Похоже на «\(candidate.word)» — \(percent)%"
+                if let reason = candidate.reason { line += " (\(reason))" }
+                text = line
+            }
         }
         if hint != text { hint = text }
     }
@@ -432,39 +472,50 @@ final class GestureViewModel: ObservableObject {
     /// Скорость ведущей руки в ладонях в секунду. Ведущая — та, что ближе к прошлому положению
     /// (чтобы не «прыгать» между руками). Скорость считается по смещению примерно за 0,1 с:
     /// так она меньше зависит от дрожания точек, чем смещение за один кадр.
-    private func trackVelocity(_ hands: [HandSample], now: Double) -> CGVector? {
-        mainHistory.removeAll { now - $0.time > 0.4 }
+    private func trackHands(_ hands: [HandSample], now: Double) -> (velocities: [CGVector], main: Int?) {
+        centerHistory.removeAll { now - $0.time > 0.4 }
         guard !hands.isEmpty else {
-            mainHistory.removeAll()
-            return nil
+            centerHistory.removeAll()
+            mainCenter = nil
+            return ([], nil)
         }
-        let main: HandSample
-        if let previous = mainHistory.last {
-            main = hands.min { dist($0.center, previous.center) < dist($1.center, previous.center) }!
-        } else {
-            main = hands.max { $0.palmSize < $1.palmSize }!
+        let reference = centerHistory.last { now - $0.time >= 0.08 }
+        centerHistory.append((time: now, centers: hands.map(\.center)))
+
+        let velocities: [CGVector] = hands.map { hand in
+            let size = hand.palmSize
+            guard let reference, size > 0,
+                  let start = reference.centers.min(by: { dist($0, hand.center) < dist($1, hand.center) }),
+                  dist(start, hand.center) < size * 3 else { return .zero }
+            let dt = CGFloat(now - reference.time)
+            return CGVector(dx: (hand.center.x - start.x) / size / dt,
+                            dy: (hand.center.y - start.y) / size / dt)
         }
-        let center = main.center
-        let size = main.palmSize
-        // Ведущая рука «перескочила» (другая рука, ошибка Vision) — скорость считаем заново.
-        if let previous = mainHistory.last, dist(previous.center, center) > size * 1.5 {
-            mainHistory.removeAll()
+        let speeds = velocities.map { hypot($0.dx, $0.dy) }
+
+        // Прошлая ведущая рука — та, что ближе к её прошлому положению; в начале — самая крупная.
+        var main = hands.indices.max { hands[$0].palmSize < hands[$1].palmSize }!
+        if let previous = mainCenter {
+            main = hands.indices.min { dist(hands[$0].center, previous) < dist(hands[$1].center, previous) }!
         }
-        let reference = mainHistory.last { now - $0.time >= 0.08 }
-        mainHistory.append((time: now, center: center))
-        guard let reference, size > 0 else { return .zero }
-        let dt = CGFloat(now - reference.time)
-        return CGVector(dx: (center.x - reference.center.x) / size / dt,
-                        dy: (center.y - reference.center.y) / size / dt)
+        // Ведущей становится другая рука, если она движется заметно быстрее
+        // (неподвижная опущенная рука не должна «перехватывать» жест).
+        if let fastest = speeds.indices.max(by: { speeds[$0] < speeds[$1] }), fastest != main,
+           speeds[fastest] > 1.0, speeds[fastest] > speeds[main] * 1.5 {
+            main = fastest
+        }
+        mainCenter = hands[main].center
+        return (velocities, main)
     }
 
     /// Возвращает true, если распознан жест с движением.
-    private func recognizeMotion(frame: SignFrame?, now: Double) -> Bool {
+    private func recognizeMotion(frame: SignFrame?, mainFrame: SignFrame?, now: Double) -> Bool {
         guard library.hasDynamicSigns else { return false }
 
         if now - lastHandSeenTime > 0.5 { motionBuffer.removeAll() }
         if let frame, now >= motionCooldownUntil {
-            motionBuffer.append((time: now, item: FrameFeatures(frame)))
+            let sample = MotionSample(all: FrameFeatures(frame), main: mainFrame.map(FrameFeatures.init))
+            motionBuffer.append((time: now, item: sample))
         }
         let window = library.motionWindow
         motionBuffer.removeAll { now - $0.time > window }
@@ -476,7 +527,14 @@ final class GestureViewModel: ObservableObject {
         // Кадры с равным шагом по времени — так же, как при подготовке записанного жеста.
         var best: MotionSpotter.Match?
         if frame != nil, motionBuffer.count >= 8 {
-            best = library.bestMotion(MotionStream(SignMatching.resample(motionBuffer)))
+            let samples = SignMatching.resample(motionBuffer)
+            var streams = [MotionStream(samples.map(\.all))]
+            // Если в кадре бывает вторая рука, отдельно сравниваем ведущую руку с жестами одной рукой.
+            if samples.contains(where: { $0.all.handCount == 2 }) {
+                let main = samples.compactMap(\.main)
+                if main.count >= 4 { streams.append(MotionStream(main)) }
+            }
+            best = library.bestMotion(streams)
         }
         // Жест засчитывается, когда сходство перестало расти (см. `MotionSpotter`).
         guard let id = spotter.update(best: best, time: now), let sign = library.sign(id: id) else { return false }
@@ -496,13 +554,13 @@ final class GestureViewModel: ObservableObject {
     /// Статичный жест.
     /// «Перевод»: только жесты из словаря пользователя.
     /// «Управление»: встроенные жесты.
-    private func classifyStatic(_ hands: [HandGeometry], features: FrameFeatures?) -> Sign {
+    private func classifyStatic(_ hands: [HandGeometry], variants: [FrameFeatures]) -> Sign {
         switch mode {
         case .translate:
-            guard let features else { return .none }
+            guard !variants.isEmpty else { return .none }
             var sticky: UUID?
             if case .custom(let id, _) = currentSign { sticky = id }
-            if let sign = library.classifyPose(features, sticky: sticky) {
+            if let sign = library.classifyPose(variants, sticky: sticky) {
                 return .custom(id: sign.id, word: sign.word)
             }
             return .none
@@ -650,6 +708,8 @@ final class GestureViewModel: ObservableObject {
         recordingPrompt = pendingPrompts.removeFirst()
         recordingStep += 1
         recordedFrames = []
+        recordedMainFrames = []
+        recordedSpeeds = []
         let countdown = recordingStep == 1 ? 3 : 2
 
         Task {
@@ -666,12 +726,29 @@ final class GestureViewModel: ObservableObject {
         recording = .idle
         resetRecognition()
 
-        // Оставляем кадры с тем числом рук, которое было видно чаще всего.
-        let groups = Dictionary(grouping: recordedFrames, by: { $0.item.handCount })
-        let handCount = groups.max { $0.value.count < $1.value.count }?.key ?? 1
-        let timed = recordedFrames.filter { $0.item.handCount == handCount }
+        let timed: [(time: Double, item: SignFrame)]
+        if recordingDynamic {
+            // Жест двумя руками — если вторая рука видна почти всё время и тоже движется.
+            // Иначе вторая рука просто оказалась в кадре: записываем только ведущую руку.
+            let withOther = recordedSpeeds.compactMap(\.other)
+            let mainSpeed = recordedSpeeds.map(\.main).reduce(0, +) / Double(max(1, recordedSpeeds.count))
+            let otherSpeed = withOther.reduce(0, +) / Double(max(1, withOther.count))
+            let twoHanded = Double(withOther.count) >= 0.6 * Double(max(1, recordedSpeeds.count))
+                && otherSpeed >= 0.4 * mainSpeed
+            timed = twoHanded
+                ? recordedFrames.filter { $0.item.handCount == 2 }
+                : recordedMainFrames.filter { $0.item.handCount == 1 }
+        } else {
+            // Поза: кадры с тем числом рук, которое было видно чаще всего.
+            let groups = Dictionary(grouping: recordedFrames, by: { $0.item.handCount })
+            let count = groups.max { $0.value.count < $1.value.count }?.key ?? 1
+            timed = recordedFrames.filter { $0.item.handCount == count }
+        }
+        let handCount = timed.first?.item.handCount ?? 1
         let frames = timed.map(\.item)
         recordedFrames = []
+        recordedMainFrames = []
+        recordedSpeeds = []
         // Похожее слово проверяем по первой записи («прямо к камере»), до того как она попадёт в словарь.
         let isFirstStep = recordingStep == 1
 
