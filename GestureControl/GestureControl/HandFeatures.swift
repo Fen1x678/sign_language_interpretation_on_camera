@@ -490,10 +490,15 @@ struct MotionTemplate {
         let known = chirality != 0 && stream.chirality != 0
         let same = chirality == stream.chirality
         let penalty = SignMatching.wrongHandPenalty
-        let candidates: [(frames: [FrameFeatures], penalty: Float)] = !known
-            ? [(stream.frames, 1), (stream.mirrored, 1)]
-            : (same ? [(stream.frames, 1), (stream.mirrored, penalty)]
-                    : [(stream.mirrored, 1), (stream.frames, penalty)])
+        let normal: Float = 1
+        let candidates: [(frames: [FrameFeatures], penalty: Float)]
+        if !known {
+            candidates = [(stream.frames, normal), (stream.mirrored, normal)]
+        } else if same {
+            candidates = [(stream.frames, normal), (stream.mirrored, penalty)]
+        } else {
+            candidates = [(stream.mirrored, normal), (stream.frames, penalty)]
+        }
         for (frames, extra) in candidates {
             let (raw, start) = SignMatching.subsequenceDTW(template: self.frames, stream: frames,
                                                            abandonAbove: min(result.cost, abandonAbove) / extra)
