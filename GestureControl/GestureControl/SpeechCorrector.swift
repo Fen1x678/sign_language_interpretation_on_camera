@@ -7,7 +7,9 @@ import UIKit
 /// что чаще всего мешает при дефектах речи:
 /// • запинки: «п-п-привет» → «привет», «прив привет» → «привет»;
 /// • повторы одного слова подряд: «я я я хочу» → «я хочу»;
-/// • звуки-паузы: «э», «ээ», «мм»;
+/// • повторы из двух-трёх слов: «я хочу я хочу пойти» → «я хочу пойти»;
+/// • растянутые звуки: «приииивет» → «привет»;
+/// • звуки-паузы: «э», «ээээ», «мммм», «хмм»;
 /// • слова из словаря пользователя (имена, термины, слова из словаря жестов), распознанные
 ///   с ошибкой в одну-две буквы: «Натаща» → «Наташа»;
 /// • слова, которых нет в русском словаре iPhone: подбирается ближайшее слово с учётом
@@ -47,7 +49,7 @@ struct SpeechCorrector {
         tokens = tokens.compactMap { token in
             var token = token
             if let fixed = Self.fixHyphenStutter(token.core) { token.core = fixed }
-            return Self.fillers.contains(token.core.lowercased()) ? nil : token
+            return Self.isFiller(token.core) ? nil : token
         }
 
         // 2. Повторы одного слова подряд и начала слова перед самим словом.
@@ -67,7 +69,10 @@ struct SpeechCorrector {
             result.append(token)
         }
 
-        // 3. Слова из словаря пользователя и орфография.
+        // 3. Повторы из двух-трёх слов подряд.
+        result = Self.removeRepeatedGroups(result)
+
+        // 4. Слова из словаря пользователя и орфография.
         for i in result.indices {
             result[i].core = fixWord(result[i].core)
         }
@@ -80,22 +85,32 @@ struct SpeechCorrector {
     // MARK: Слова
 
     private mutating func fixWord(_ word: String) -> String {
-        let lower = Self.normalized(word)
-        guard lower.count >= 3, lower.allSatisfy(\.isLetter) else { return word }
+        let original = Self.normalized(word)
+        guard original.count >= 3, original.allSatisfy(\.isLetter) else { return word }
         if let cached = cache[word] { return cached }
 
-        var fixed = lower
-        if vocabularyWords.contains(lower) {
-            fixed = lower
-        } else if let known = closest(to: lower, among: vocabularyWords, maxCost: lower.count >= 7 ? 2 : 1) {
-            fixed = known
-        } else if lower.count >= 4, word.first?.isLowercase == true, spellCheckAvailable, isMisspelled(lower),
-                  let guess = closest(to: lower, among: guesses(for: lower), maxCost: 1.5) {
-            // Слова с заглавной буквы (обычно имена) по словарю iPhone не исправляем:
-            // имени может не быть в словаре, и «исправление» его испортит.
-            fixed = guess
+        var lower = original
+        var fixed: String?
+        // Растянутый звук: «приииивет», «ооочень», «ссссобака». Оставляем одну или две
+        // одинаковые буквы — какой вариант есть в словаре; если ни одного, то одну.
+        if let variants = Self.collapsedVariants(original) {
+            fixed = variants.first { vocabularyWords.contains($0) || (spellCheckAvailable && !isMisspelled($0)) }
+            lower = variants[0]
         }
-        let result = fixed == lower ? word : Self.matchCase(fixed, like: word)
+        if fixed == nil, lower.count >= 3 {
+            if vocabularyWords.contains(lower) {
+                fixed = lower
+            } else if let known = closest(to: lower, among: vocabularyWords, maxCost: lower.count >= 7 ? 2 : 1) {
+                fixed = known
+            } else if lower.count >= 4, word.first?.isLowercase == true, spellCheckAvailable, isMisspelled(lower),
+                      let guess = closest(to: lower, among: guesses(for: lower), maxCost: 1.5) {
+                // Слова с заглавной буквы (обычно имена) по словарю iPhone не исправляем:
+                // имени может не быть в словаре, и «исправление» его испортит.
+                fixed = guess
+            }
+        }
+        let chosen = fixed ?? lower
+        let result = chosen == original ? word : Self.matchCase(chosen, like: word)
         if cache.count > 2000 { cache.removeAll() }
         cache[word] = result
         return result
@@ -147,6 +162,56 @@ struct SpeechCorrector {
             swap(&prev, &cur)
         }
         return prev[b.count]
+    }
+
+    /// Звук-пауза: «э», «ээээ», «мммм», «эмм», «хмм».
+    private static func isFiller(_ word: String) -> Bool {
+        let w = normalized(word)
+        guard !w.isEmpty, w.count <= 8 else { return false }
+        if fillers.contains(w) { return true }
+        if Set(w).isSubset(of: ["э", "м"]) { return true }
+        return w.count >= 2 && w.first == "х" && Set(w.dropFirst()).isSubset(of: ["м"])
+    }
+
+    /// Повтор группы из двух-трёх слов подряд (внутри одного предложения): первая копия убирается.
+    private static func removeRepeatedGroups(_ input: [Token]) -> [Token] {
+        var tokens = input
+        for size in [3, 2] {
+            var i = 0
+            while i + 2 * size <= tokens.count {
+                let first = tokens[i..<(i + size)]
+                let second = tokens[(i + size)..<(i + 2 * size)]
+                let sameWords = zip(first, second).allSatisfy { a, b in
+                    !a.core.isEmpty && normalized(a.core) == normalized(b.core)
+                }
+                let oneSentence = first.allSatisfy { token in
+                    !token.trailing.contains(where: { ".!?".contains($0) })
+                }
+                if sameWords && oneSentence {
+                    tokens.removeSubrange(i..<(i + size))
+                } else {
+                    i += 1
+                }
+            }
+        }
+        return tokens
+    }
+
+    /// Варианты слова без растянутых звуков (3 и больше одинаковых букв подряд):
+    /// сначала с одной буквой, потом с двумя. nil — растянутых звуков нет.
+    private static func collapsedVariants(_ word: String) -> [String]? {
+        var runs: [(character: Character, count: Int)] = []
+        for character in word {
+            if let last = runs.last, last.character == character {
+                runs[runs.count - 1].count += 1
+            } else {
+                runs.append((character, 1))
+            }
+        }
+        guard runs.contains(where: { $0.count >= 3 }) else { return nil }
+        let single = String(runs.flatMap { run in Array(repeating: run.character, count: run.count >= 3 ? 1 : run.count) })
+        let double = String(runs.flatMap { run in Array(repeating: run.character, count: run.count >= 3 ? 2 : run.count) })
+        return [single, double]
     }
 
     /// «п-п-привет» → «привет», «при-привет» → «привет». «кто-то», «по-моему» не трогаем:

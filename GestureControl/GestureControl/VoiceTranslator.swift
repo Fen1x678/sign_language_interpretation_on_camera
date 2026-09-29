@@ -1,6 +1,8 @@
 import Foundation
 import Speech
 import AVFoundation
+import Accelerate
+import UIKit
 
 /// Фраза распознанной речи. Новая фраза начинается после паузы в разговоре —
 /// так реплики разных людей оказываются на разных строках.
@@ -12,48 +14,214 @@ struct SpokenPhrase: Identifiable, Equatable {
     let time: Date
 }
 
-/// Звук с микрофона передаётся в текущий запрос распознавания. Вызывается с аудиопотока,
-/// поэтому запрос защищён блокировкой: при смене фразы он подменяется без пропуска звука.
+/// Громкость микрофона для индикатора. Отдельный объект: индикатор обновляется 10 раз в секунду,
+/// а список фраз при этом не перерисовывается.
+@MainActor
+final class SpeechMeter: ObservableObject {
+    /// 0…1: насколько звук громче фонового шума.
+    @Published private(set) var level: Double = 0
+    /// Сейчас слышен голос.
+    @Published private(set) var hearsVoice = false
+
+    func update(level: Double, hearsVoice: Bool) {
+        if abs(level - self.level) >= 0.04 || (level == 0 && self.level != 0) { self.level = level }
+        if hearsVoice != self.hearsVoice { self.hearsVoice = hearsVoice }
+    }
+}
+
+/// Звук с микрофона. Вызывается с аудиопотока, поэтому всё защищено блокировкой.
+///
+/// • Определяет голос по громкости: уровень фонового шума отслеживается постоянно
+///   (минимум громкости за последние 4 с), голос — когда звук заметно громче шума.
+/// • Пока идёт фраза, звук передаётся в запрос распознавания.
+/// • Между фразами (тишина) звук никуда не отправляется, а копится в запасе на 0,6 с:
+///   когда кто-то заговорит, новый запрос получит и этот запас — начало фразы не теряется.
 private final class AudioSink: @unchecked Sendable {
+    struct Snapshot {
+        /// Громкость, дБ (сглажена за ~0,1 с).
+        var level: Float
+        /// Уровень фонового шума, дБ.
+        var noise: Float
+        /// Секунд с последнего звука голоса.
+        var silence: TimeInterval
+
+        /// Для индикатора: 0…1, насколько звук громче шума.
+        var meterLevel: Double { Double(min(max((level - noise - 3) / 30, 0), 1)) }
+    }
+
+    /// Голос — звук громче фонового шума на столько децибел…
+    private static let voiceMargin: Float = 8
+    /// …не меньше трёх буферов подряд (~60 мс): щелчки и стуки не считаются.
+    private static let voiceBuffers = 3
+    private static let prerollSeconds = 0.6
+    /// Фоновый шум — минимум громкости за 16 отрезков по 0,25 с (4 с): в речи всегда есть
+    /// короткие паузы между словами, поэтому речь не принимается за шум.
+    private static let noiseBlock: TimeInterval = 0.25
+    private static let noiseBlocks = 16
+
     private let lock = NSLock()
     private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var preroll: [AVAudioPCMBuffer] = []
+    private var prerollFrames: AVAudioFrameCount = 0
 
+    private var level: Float = -100
+    private var noise: Float = -90
+    private var hasLevel = false
+    private var blockMinimum = Float.greatestFiniteMagnitude
+    private var blockStart: TimeInterval = 0
+    private var minima: [Float] = []
+    private var loudBuffers = 0
+    private var lastVoice: TimeInterval = 0
+
+    /// Новый запрос распознавания (nil — пауза между фразами). Запас звука сразу уходит в него.
     func set(_ request: SFSpeechAudioBufferRecognitionRequest?) {
         lock.lock()
+        defer { lock.unlock() }
         self.request = request
-        lock.unlock()
+        if let request {
+            for buffer in preroll { request.append(buffer) }
+        }
+        preroll.removeAll()
+        prerollFrames = 0
+    }
+
+    /// Сбросить всё (микрофон включается заново).
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        request = nil
+        preroll.removeAll()
+        prerollFrames = 0
+        level = -100
+        noise = -90
+        hasLevel = false
+        blockMinimum = .greatestFiniteMagnitude
+        blockStart = 0
+        minima.removeAll()
+        loudBuffers = 0
+        lastVoice = 0
     }
 
     func append(_ buffer: AVAudioPCMBuffer) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let decibels = Self.decibels(of: buffer)
         lock.lock()
-        let request = self.request
-        lock.unlock()
-        request?.append(buffer)
+        defer { lock.unlock() }
+        analyze(decibels, now: now)
+        if let request {
+            request.append(buffer)
+        } else if let copy = Self.copy(buffer) {
+            preroll.append(copy)
+            prerollFrames += copy.frameLength
+            let limit = AVAudioFrameCount(buffer.format.sampleRate * Self.prerollSeconds)
+            while prerollFrames > limit, let first = preroll.first {
+                prerollFrames -= first.frameLength
+                preroll.removeFirst()
+            }
+        }
+    }
+
+    func snapshot() -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
+        return Snapshot(level: level, noise: noise,
+                        silence: lastVoice > 0 ? now - lastVoice : .infinity)
+    }
+
+    private func analyze(_ decibels: Float?, now: TimeInterval) {
+        guard let decibels else {
+            // Громкость не узнать (необычный формат звука) — считаем, что голос есть всегда:
+            // фразы тогда делятся по паузам в распознанном тексте.
+            lastVoice = now
+            return
+        }
+        if hasLevel {
+            level += (decibels - level) * 0.3
+        } else {
+            level = decibels
+            hasLevel = true
+            blockStart = now
+        }
+
+        blockMinimum = min(blockMinimum, level)
+        if now - blockStart >= Self.noiseBlock {
+            minima.append(blockMinimum)
+            if minima.count > Self.noiseBlocks { minima.removeFirst() }
+            noise = max(minima.min() ?? level, -90)
+            blockMinimum = .greatestFiniteMagnitude
+            blockStart = now
+        }
+
+        // Голос ищем, когда уровень шума уже известен (через 0,25 с после включения).
+        if !minima.isEmpty && level > noise + Self.voiceMargin {
+            loudBuffers += 1
+        } else {
+            loudBuffers = 0
+        }
+        if loudBuffers >= Self.voiceBuffers { lastVoice = now }
+    }
+
+    /// Громкость буфера, дБ относительно полной шкалы.
+    private static func decibels(of buffer: AVAudioPCMBuffer) -> Float? {
+        guard let data = buffer.floatChannelData, buffer.frameLength > 0 else { return nil }
+        var rms: Float = 0
+        vDSP_rmsqv(data[0], 1, &rms, vDSP_Length(buffer.frameLength))
+        return 20 * log10(max(rms, 0.000_000_1))
+    }
+
+    /// Копия буфера: буферы микрофона система использует повторно, а запас хранится дольше.
+    private static func copy(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard buffer.frameLength > 0,
+              let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength) else { return nil }
+        copy.frameLength = buffer.frameLength
+        let source = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: buffer.audioBufferList))
+        let target = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
+        for (from, to) in zip(source, target) {
+            guard let fromData = from.mData, let toData = to.mData else { continue }
+            memcpy(toData, fromData, Int(min(from.mDataByteSize, to.mDataByteSize)))
+        }
+        return copy
     }
 }
 
 /// Голосовой перевод: живая расшифровка речи в текст (распознавание речи Apple, русский язык).
 ///
-/// • Слушает непрерывно, пока открыта страница.
-/// • После паузы (`pauseToSplit` секунд) начинается новая фраза: когда говорят несколько человек,
-///   их реплики не сливаются в одну строку.
+/// • Слушает непрерывно, пока открыта страница. Голос определяется по громкости микрофона.
+/// • Каждая фраза — отдельный запрос распознавания. Фраза заканчивается, когда наступила
+///   тишина (`splitPause` секунд): реплики разных людей не сливаются в одну строку.
+/// • В тишине звук не отправляется на распознавание (меньше расход батареи и интернета),
+///   а начало следующей фразы берётся из запаса звука.
+/// • После звонка, Siri, сворачивания приложения или смены микрофона прослушивание
+///   продолжается само. Без интернета распознавание переходит на телефон (если iPhone умеет).
 /// • Текст исправляется `SpeechCorrector`: запинки, повторы, звуки-паузы, слова из словаря.
 @MainActor
 final class VoiceTranslator: ObservableObject {
     @Published private(set) var phrases: [SpokenPhrase] = []
+    /// Прослушивание включено (кнопка микрофона).
     @Published private(set) var isListening = false
     @Published private(set) var error: String?
+    /// Пояснение под кнопками: пауза из-за звонка, распознавание без интернета.
+    @Published private(set) var notice: String?
+
+    /// Громкость микрофона для индикатора.
+    let meter = SpeechMeter()
 
     /// Размер текста на экране.
     @Published var fontSize: Double {
         didSet { UserDefaults.standard.set(fontSize, forKey: Self.fontSizeKey) }
+    }
+    /// Тишина, после которой начинается новая строка, секунд. Короче — когда говорящие
+    /// быстро сменяют друг друга; длиннее — для медленной речи с паузами внутри фразы.
+    @Published var splitPause: Double {
+        didSet { UserDefaults.standard.set(splitPause, forKey: Self.splitPauseKey) }
     }
     /// Распознавать только на телефоне, без отправки звука на серверы Apple
     /// (точность может быть ниже; доступно не на всех iPhone).
     @Published var onDeviceOnly: Bool {
         didSet {
             UserDefaults.standard.set(onDeviceOnly, forKey: Self.onDeviceKey)
-            if isListening { finishPhrase() }
+            endPhrase()
         }
     }
     /// Слова, которые должны распознаваться точно: имена, названия, термины.
@@ -66,10 +234,21 @@ final class VoiceTranslator: ObservableObject {
 
     var supportsOnDevice: Bool { recognizer?.supportsOnDeviceRecognition ?? false }
 
-    /// Пауза, после которой начинается новая фраза, секунд.
-    private let pauseToSplit: TimeInterval = 1.3
-    /// Одна фраза не длиннее этого (у распознавания Apple есть ограничение на длину запроса).
-    private let maxPhraseDuration: TimeInterval = 50
+    /// Запасной признак конца фразы: распознанный текст не меняется дольше паузы на столько секунд
+    /// (например, в шумном месте, где тишину по громкости не определить).
+    private let textPauseExtra: TimeInterval = 0.4
+    /// Голос считается звучащим, если он был слышен за последние столько секунд.
+    private let voiceHold: TimeInterval = 0.3
+    /// Длинная речь без пауз делится на фразы: после этой длительности — на первой короткой паузе…
+    private let softPhraseDuration: TimeInterval = 35
+    private let shortPause: TimeInterval = 0.35
+    /// …и не позже этой (у распознавания Apple есть ограничение на длину запроса).
+    private let maxPhraseDuration: TimeInterval = 55
+    /// Если окончательный текст фразы так и не пришёл, она закрывается через столько секунд.
+    private let finalTimeout: TimeInterval = 6
+    /// После ошибки сервера распознаём на телефоне столько секунд, потом снова пробуем сервер.
+    private let offlineRetry: TimeInterval = 30
+    private let maxPhrases = 400
 
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "ru-RU"))
     private let audioEngine = AVAudioEngine()
@@ -78,19 +257,37 @@ final class VoiceTranslator: ObservableObject {
     private var generation = 0
     private var phraseStart = Date()
     private var lastChange = Date()
+    private var currentHasText = false
+    /// Последний необработанный текст каждой незаконченной фразы: одинаковые результаты не исправляются заново.
+    private var lastRaw: [Int: String] = [:]
+    /// Фразы, ожидающие окончательного текста, и когда они закончились.
+    private var endedPhrases: [Int: Date] = [:]
+    /// Микрофон включён (при звонке или в фоне выключается, хотя прослушивание остаётся включённым).
+    private var running = false
+    private var startToken = 0
+    private var nextPhraseAllowed = Date.distantPast
+    private var serverRetryAt: Date?
+    private var lastAudioRestart = Date.distantPast
     private var monitor: Task<Void, Never>?
+    private var retry: Task<Void, Never>?
+    private var observers: [NSObjectProtocol] = []
     private var failures: [Date] = []
     private var dictionaryWords: [String] = []
     private var corrector = SpeechCorrector()
 
     private static let fontSizeKey = "speechFontSize"
+    private static let splitPauseKey = "speechSplitPause"
     private static let onDeviceKey = "speechOnDeviceOnly"
     private static let wordsKey = "speechCustomWords"
+    private static let offlineNotice = "Нет связи с сервером — распознаю на телефоне"
+    private static let busyNotice = "Пауза: микрофон занят (звонок или другое приложение). Продолжу автоматически."
 
     init() {
         let defaults = UserDefaults.standard
         let size = defaults.double(forKey: Self.fontSizeKey)
         fontSize = size > 0 ? size : 30
+        let pause = defaults.double(forKey: Self.splitPauseKey)
+        splitPause = pause > 0 ? pause : 1.2
         onDeviceOnly = defaults.bool(forKey: Self.onDeviceKey)
         customWords = defaults.stringArray(forKey: Self.wordsKey) ?? []
         updateVocabulary()
@@ -115,6 +312,8 @@ final class VoiceTranslator: ObservableObject {
 
     func start() async {
         guard !isListening else { return }
+        startToken += 1
+        let token = startToken
         error = nil
         guard let recognizer else {
             error = "Распознавание русской речи на этом iPhone недоступно."
@@ -128,51 +327,30 @@ final class VoiceTranslator: ObservableObject {
             error = "Нет доступа к микрофону. Разрешите его: Настройки → GestureControl → Микрофон."
             return
         }
-        guard recognizer.isAvailable || (onDeviceOnly && recognizer.supportsOnDeviceRecognition) else {
-            error = "Распознавание речи сейчас недоступно. Проверьте интернет"
-                + (recognizer.supportsOnDeviceRecognition ? " или включите «Только на телефоне»." : ".")
-            return
-        }
-
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.record, mode: .measurement, options: [.duckOthers])
-            try session.setActive(true, options: .notifyOthersOnDeactivation)
-
-            let input = audioEngine.inputNode
-            let format = input.outputFormat(forBus: 0)
-            guard format.sampleRate > 0 else {
-                error = "Микрофон недоступен."
-                return
-            }
-            input.removeTap(onBus: 0)
-            let sink = self.sink
-            input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-                sink.append(buffer)
-            }
-            audioEngine.prepare()
-            try audioEngine.start()
-        } catch {
-            self.error = "Не удалось включить микрофон: \(error.localizedDescription)"
+        // Пока спрашивали разрешения, страницу могли закрыть.
+        guard token == startToken, !isListening else { return }
+        guard recognizer.isAvailable || recognizer.supportsOnDeviceRecognition else {
+            error = "Распознавание речи сейчас недоступно. Проверьте интернет."
             return
         }
 
         isListening = true
         failures = []
-        startPhrase()
-        startMonitor()
+        serverRetryAt = nil
+        finalizeEnded()
+        observeSystemEvents()
+        resumeAudio(automatic: false)
     }
 
     func stop() {
+        startToken += 1
+        retry?.cancel()
+        retry = nil
         guard isListening else { return }
         isListening = false
-        monitor?.cancel()
-        monitor = nil
-        request?.endAudio()   // последняя фраза ещё допишется
-        request = nil
-        sink.set(nil)
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
+        setNotice(nil)
+        removeObservers()
+        suspendAudio()
         // Возвращаем звук для озвучки перевода жестов (как на главном экране).
         let session = AVAudioSession.sharedInstance()
         try? session.setActive(false, options: .notifyOthersOnDeactivation)
@@ -181,13 +359,150 @@ final class VoiceTranslator: ObservableObject {
 
     func clear() {
         phrases.removeAll()
+        lastRaw.removeAll()
+    }
+
+    // MARK: Микрофон
+
+    /// Включить микрофон: при старте и после перерыва (звонок, сворачивание, смена микрофона).
+    private func resumeAudio(automatic: Bool) {
+        guard isListening, !running else { return }
+        guard UIApplication.shared.applicationState != .background else { return }
+        lastAudioRestart = Date()
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.record, mode: .measurement, options: [.duckOthers])
+            try session.setActive(true, options: .notifyOthersOnDeactivation)
+
+            let input = audioEngine.inputNode
+            let format = input.outputFormat(forBus: 0)
+            guard format.sampleRate > 0, format.channelCount > 0 else {
+                throw NSError(domain: "GestureControl", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "Микрофон недоступен."])
+            }
+            input.removeTap(onBus: 0)
+            sink.reset()
+            let sink = self.sink
+            input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+                sink.append(buffer)
+            }
+            audioEngine.prepare()
+            try audioEngine.start()
+        } catch {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            if automatic {
+                // Микрофон ещё занят (например, идёт звонок) — пробуем снова чуть позже.
+                setNotice(Self.busyNotice)
+                scheduleResume(after: 2)
+            } else {
+                stop()
+                self.error = "Не удалось включить микрофон: \(error.localizedDescription)"
+            }
+            return
+        }
+        running = true
+        setNotice(nil)
+        startMonitor()
+    }
+
+    /// Выключить микрофон; текущая фраза дописывается.
+    private func suspendAudio() {
+        monitor?.cancel()
+        monitor = nil
+        endPhrase()
+        if running {
+            audioEngine.stop()
+            audioEngine.inputNode.removeTap(onBus: 0)
+            running = false
+        }
+        sink.reset()
+        meter.update(level: 0, hearsVoice: false)
+    }
+
+    private func restartAudio() {
+        guard isListening, running else { return }
+        suspendAudio()
+        resumeAudio(automatic: true)
+    }
+
+    private func scheduleResume(after seconds: Double) {
+        retry?.cancel()
+        retry = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled, let self else { return }
+            self.resumeAudio(automatic: true)
+        }
+    }
+
+    // MARK: События системы
+
+    private func observeSystemEvents() {
+        guard observers.isEmpty else { return }
+        let center = NotificationCenter.default
+        // Звонок, будильник, Siri: микрофон отбирают — ставим на паузу и продолжаем после.
+        observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification,
+                                            object: nil, queue: nil) { [weak self] note in
+            let type = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            let began = type == AVAudioSession.InterruptionType.began.rawValue
+            let translator = self
+            Task { @MainActor in translator?.interruption(began: began) }
+        })
+        // Подключили или отключили наушники, сменился микрофон: система останавливает звук.
+        observers.append(center.addObserver(forName: .AVAudioEngineConfigurationChange,
+                                            object: audioEngine, queue: nil) { [weak self] _ in
+            let translator = self
+            Task { @MainActor in translator?.audioConfigurationChanged() }
+        })
+        observers.append(center.addObserver(forName: UIApplication.didEnterBackgroundNotification,
+                                            object: nil, queue: nil) { [weak self] _ in
+            let translator = self
+            Task { @MainActor in translator?.enteredBackground() }
+        })
+        observers.append(center.addObserver(forName: UIApplication.didBecomeActiveNotification,
+                                            object: nil, queue: nil) { [weak self] _ in
+            let translator = self
+            Task { @MainActor in translator?.becameActive() }
+        })
+    }
+
+    private func removeObservers() {
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+        observers.removeAll()
+    }
+
+    private func interruption(began: Bool) {
+        guard isListening else { return }
+        if began {
+            suspendAudio()
+            setNotice(Self.busyNotice)
+            // Сообщение о конце перерыва приходит не всегда — время от времени пробуем сами.
+            scheduleResume(after: 3)
+        } else {
+            scheduleResume(after: 0.4)
+        }
+    }
+
+    private func audioConfigurationChanged() {
+        guard isListening, running, !audioEngine.isRunning else { return }
+        restartAudio()
+    }
+
+    private func enteredBackground() {
+        guard isListening else { return }
+        retry?.cancel()
+        suspendAudio()
+    }
+
+    private func becameActive() {
+        guard isListening, !running else { return }
+        resumeAudio(automatic: true)
     }
 
     // MARK: Фразы
 
-    /// Новый запрос распознавания — новая фраза. Звук переключается на него без паузы.
-    private func startPhrase() {
-        guard let recognizer, isListening else { return }
+    /// Кто-то заговорил — новый запрос распознавания. Начало речи берётся из запаса звука.
+    private func beginPhrase() {
+        guard let recognizer, running else { return }
         generation += 1
         let id = generation
 
@@ -196,81 +511,174 @@ final class VoiceTranslator: ObservableObject {
         request.taskHint = .dictation
         request.addsPunctuation = true
         request.contextualStrings = Array(vocabulary.prefix(100))
-        if onDeviceOnly && recognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true
-        }
+        let onDevice = useOnDevice(recognizer)
+        if onDevice { request.requiresOnDeviceRecognition = true }
+        setNotice(onDevice && !onDeviceOnly ? Self.offlineNotice : nil)
+
         self.request = request
-        sink.set(request)
         phraseStart = Date()
-        lastChange = Date()
+        lastChange = phraseStart
+        currentHasText = false
 
         recognizer.recognitionTask(with: request) { [weak self] result, error in
-            // Результат приходит не на главном потоке: берём из него только строки и флаги.
+            // Из результата берём только строки и числа — их можно передать на главный поток.
             let text = result?.bestTranscription.formattedString
             let isFinal = result?.isFinal ?? false
-            let failed = error != nil
+            let nsError = error.map { $0 as NSError }
+            let domain = nsError?.domain
+            let code = nsError?.code ?? 0
             let translator = self
             Task { @MainActor in
-                translator?.handle(id: id, text: text, isFinal: isFinal, failed: failed)
+                translator?.handle(id: id, text: text, isFinal: isFinal, errorDomain: domain, errorCode: code)
             }
         }
+        sink.set(request)
     }
 
-    /// Закончить текущую фразу (человек замолчал) и сразу начать следующую.
-    private func finishPhrase() {
-        request?.endAudio()
-        startPhrase()
+    /// Фраза закончена: запрос дописывает окончательный текст, а звук до следующей речи копится в запасе.
+    private func endPhrase() {
+        guard let request else { return }
+        request.endAudio()
+        self.request = nil
+        sink.set(nil)
+        endedPhrases[generation] = Date()
     }
 
-    private func handle(id: Int, text: String?, isFinal: Bool, failed: Bool) {
-        if let text, !text.isEmpty {
+    private func useOnDevice(_ recognizer: SFSpeechRecognizer) -> Bool {
+        guard recognizer.supportsOnDeviceRecognition else { return false }
+        if onDeviceOnly || !recognizer.isAvailable { return true }
+        if let until = serverRetryAt {
+            if Date() < until { return true }
+            serverRetryAt = nil
+        }
+        return false
+    }
+
+    private func handle(id: Int, text: String?, isFinal: Bool, errorDomain: String?, errorCode: Int) {
+        let existing = phrases.lastIndex { $0.id == id }
+        // Запоздавший промежуточный результат уже закрытой фразы.
+        if let existing, phrases[existing].isFinal, !isFinal { return }
+
+        if let text, !text.isEmpty, lastRaw[id] != text {
+            lastRaw[id] = text
             let corrected = corrector.correct(text)
-            if let i = phrases.firstIndex(where: { $0.id == id }) {
-                if phrases[i].text != corrected { phrases[i].text = corrected }
-            } else {
-                phrases.append(SpokenPhrase(id: id, text: corrected, isFinal: false, time: Date()))
-                if phrases.count > 300 { phrases.removeFirst(phrases.count - 300) }
+            if let existing {
+                if corrected.isEmpty {
+                    phrases.remove(at: existing)
+                } else if phrases[existing].text != corrected {
+                    phrases[existing].text = corrected
+                }
+            } else if !corrected.isEmpty {
+                // Фразы по порядку, даже если текст предыдущей пришёл позже начала следующей.
+                let position = phrases.lastIndex { $0.id < id }.map { $0 + 1 } ?? 0
+                phrases.insert(SpokenPhrase(id: id, text: corrected, isFinal: false, time: Date()), at: position)
+                if phrases.count > maxPhrases { phrases.removeFirst(phrases.count - maxPhrases) }
             }
-            if id == generation { lastChange = Date() }
+            if id == generation && request != nil {
+                lastChange = Date()
+                currentHasText = true
+            }
         }
 
+        let failed = errorDomain != nil
         guard isFinal || failed else { return }
-        if let i = phrases.firstIndex(where: { $0.id == id }) { phrases[i].isFinal = true }
-        // Текущий запрос закончился сам (тишина, ошибка сети) — продолжаем слушать с новым.
-        guard id == generation, isListening else { return }
-        if failed {
-            let now = Date()
-            failures = failures.filter { now.timeIntervalSince($0) < 5 } + [now]
-            if failures.count >= 5 {
-                stop()
-                error = "Распознавание речи прерывается. Проверьте интернет"
-                    + (supportsOnDevice ? " или включите «Только на телефоне»." : ".")
-                return
-            }
+        finalize(id)
+
+        // Текущий запрос закончился сам (ошибка сети, ограничение длительности):
+        // следующая фраза начнётся с новым запросом, как только снова зазвучит голос.
+        guard id == generation, request != nil else { return }
+        request = nil
+        sink.set(nil)
+        if let errorDomain, !Self.isHarmless(domain: errorDomain, code: errorCode) {
+            registerFailure()
         }
-        startPhrase()
     }
 
-    /// Раз в 0,3 с: если после последнего слова пауза — фраза закончена, начинается новая строка.
+    private func finalize(_ id: Int) {
+        lastRaw[id] = nil
+        endedPhrases[id] = nil
+        guard let i = phrases.lastIndex(where: { $0.id == id }) else { return }
+        if !phrases[i].isFinal { phrases[i].isFinal = true }
+    }
+
+    private func finalizeEnded() {
+        for id in endedPhrases.keys { finalize(id) }
+    }
+
+    /// «Речь не обнаружена» и отмена запроса — не ошибки.
+    private static func isHarmless(domain: String, code: Int) -> Bool {
+        switch (domain, code) {
+        case ("kAFAssistantErrorDomain", 1110), ("kAFAssistantErrorDomain", 216), ("kLSRErrorDomain", 301):
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func registerFailure() {
+        let now = Date()
+        nextPhraseAllowed = now.addingTimeInterval(0.5)
+        failures = failures.filter { now.timeIntervalSince($0) < 10 } + [now]
+        if let recognizer, recognizer.supportsOnDeviceRecognition, !onDeviceOnly, serverRetryAt == nil {
+            // Скорее всего, пропал интернет — пока распознаём на телефоне.
+            serverRetryAt = now.addingTimeInterval(offlineRetry)
+            failures = [now]
+            return
+        }
+        if failures.count >= 5 {
+            stop()
+            error = "Распознавание речи прерывается. Проверьте интернет"
+                + (supportsOnDevice && !onDeviceOnly ? " или включите «Только на телефоне»." : ".")
+        }
+    }
+
+    // MARK: Слежение за паузами
+
+    /// 10 раз в секунду: индикатор громкости, начало и конец фраз.
     private func startMonitor() {
         monitor?.cancel()
         monitor = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(300))
-                guard let self else { return }
-                self.checkPause()
+                try? await Task.sleep(for: .milliseconds(100))
+                guard !Task.isCancelled, let self else { return }
+                self.tick()
             }
         }
     }
 
-    private func checkPause() {
-        guard isListening else { return }
+    private func tick() {
+        guard running else { return }
         let now = Date()
-        let hasText = phrases.last?.id == generation
-        if (hasText && now.timeIntervalSince(lastChange) > pauseToSplit)
-            || now.timeIntervalSince(phraseStart) > maxPhraseDuration {
-            finishPhrase()
+        // Звук остановился, а уведомление о смене микрофона не пришло.
+        if !audioEngine.isRunning {
+            if now.timeIntervalSince(lastAudioRestart) > 2 { restartAudio() }
+            return
         }
+
+        let audio = sink.snapshot()
+        let hearsVoice = audio.silence < voiceHold
+        meter.update(level: audio.meterLevel, hearsVoice: hearsVoice)
+
+        for (id, ended) in endedPhrases where now.timeIntervalSince(ended) > finalTimeout {
+            finalize(id)
+        }
+
+        guard request != nil else {
+            if hearsVoice && now >= nextPhraseAllowed { beginPhrase() }
+            return
+        }
+        let duration = now.timeIntervalSince(phraseStart)
+        let silentText = currentHasText && now.timeIntervalSince(lastChange) >= splitPause + textPauseExtra
+        if audio.silence >= splitPause
+            || silentText
+            || (duration >= softPhraseDuration && audio.silence >= shortPause)
+            || duration >= maxPhraseDuration {
+            endPhrase()
+        }
+    }
+
+    private func setNotice(_ text: String?) {
+        if notice != text { notice = text }
     }
 
     private static func requestSpeechPermission() async -> SFSpeechRecognizerAuthorizationStatus {
