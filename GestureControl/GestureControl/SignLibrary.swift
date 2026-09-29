@@ -141,6 +141,62 @@ struct HandSmoother {
     }
 }
 
+// MARK: - Сглаживание плеч
+
+/// Плечи сглаживаются тем же фильтром One Euro, что и точки рук, и так же быстро следуют за человеком.
+struct ShoulderSmoother {
+    var minCutoff: Double = 1.7
+    var beta: Double = 3.0
+    var derivativeCutoff: Double = 1.0
+
+    private var points: [CGPoint] = []
+    private var velocity: [CGVector] = []
+    private var time: Double = 0
+
+    mutating func reset() {
+        points = []
+        velocity = []
+    }
+
+    private static func alpha(cutoff: Double, dt: Double) -> CGFloat {
+        let tau = 1 / (2 * Double.pi * cutoff)
+        return CGFloat(1 / (1 + tau / dt))
+    }
+
+    /// - Parameter found: плечи на этом кадре, слева направо; nil — не найдены.
+    /// - Returns: сглаженные плечи или пусто.
+    mutating func smooth(_ found: [CGPoint]?, time now: Double) -> [CGPoint] {
+        guard let found, found.count == 2 else {
+            // Плечи пропали: как и руки, прежнее положение держим только долю секунды.
+            if now - time > 0.2 { reset() }
+            return points
+        }
+        // Скорость считаем в «ладонях» — примерно треть расстояния между плечами.
+        let size = max(dist(found[0], found[1]) / 3, 1)
+        guard points.count == 2, now - time < 0.25, dist(points[0], found[0]) < size * 3 else {
+            points = found
+            velocity = [.zero, .zero]
+            time = now
+            return points
+        }
+        let dt = max(0.001, now - time)
+        let ad = Self.alpha(cutoff: derivativeCutoff, dt: dt)
+        for j in 0..<2 {
+            let raw = CGVector(dx: (found[j].x - points[j].x) / CGFloat(dt),
+                               dy: (found[j].y - points[j].y) / CGFloat(dt))
+            let v = CGVector(dx: ad * raw.dx + (1 - ad) * velocity[j].dx,
+                             dy: ad * raw.dy + (1 - ad) * velocity[j].dy)
+            velocity[j] = v
+            let speed = Double((v.dx * v.dx + v.dy * v.dy).squareRoot() / size)
+            let a = Self.alpha(cutoff: minCutoff + beta * speed, dt: dt)
+            points[j] = CGPoint(x: points[j].x + a * (found[j].x - points[j].x),
+                                y: points[j].y + a * (found[j].y - points[j].y))
+        }
+        time = now
+        return points
+    }
+}
+
 // MARK: - Сырые данные жеста (хранятся в словаре)
 
 /// Поза одной руки: 21 точка относительно запястья, в размерах ладони (x0, y0, x1, y1, … — 42 числа),
@@ -325,6 +381,10 @@ final class SignLibrary: ObservableObject {
     }
     private var cache: [UUID: Cache] = [:]
 
+    /// Самое похожее слово на последних сравнениях и его расстояние относительно порога
+    /// (меньше 1 — достаточно похоже). Нужно для подсказки на экране.
+    private(set) var lastCandidate: (word: String, ratio: Float)?
+
     /// Сколько кадров позы на слово брать для сравнения (остальные прореживаются).
     private let maxPoseFrames = 60
     /// Сколько кадров позы сохранять из одной записи.
@@ -416,6 +476,16 @@ final class SignLibrary: ObservableObject {
 
     // MARK: Распознавание
 
+    func resetCandidate() {
+        lastCandidate = nil
+    }
+
+    private func noteCandidate(_ costs: [(sign: CustomSign, ratio: Float)]) {
+        guard let best = costs.min(by: { $0.ratio < $1.ratio }) else { return }
+        if let current = lastCandidate, current.ratio <= best.ratio { return }
+        lastCandidate = (best.sign.word, best.ratio)
+    }
+
     /// Поза. `sticky` — жест, который уже распознаётся: для него порог немного мягче,
     /// чтобы распознавание не «мигало» от случайного дрожания руки.
     func classifyPose(_ live: FrameFeatures, sticky: UUID?) -> CustomSign? {
@@ -427,6 +497,7 @@ final class SignLibrary: ObservableObject {
             let d = Self.poseCost(live, mirrored, c.poses)
             if d.isFinite { costs.append((sign, d / (c.poseThreshold * scale))) }
         }
+        noteCandidate(costs)
         return decide(costs, sticky: sticky)?.sign
     }
 
@@ -446,6 +517,7 @@ final class SignLibrary: ObservableObject {
             }
             if best.isFinite { costs.append((sign, best / limit)) }
         }
+        noteCandidate(costs)
         guard let best = decide(costs, sticky: nil) else { return nil }
         return MotionSpotter.Match(id: best.sign.id, cost: best.ratio)
     }

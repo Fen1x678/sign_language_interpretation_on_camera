@@ -33,9 +33,8 @@ struct CameraBody {
 /// • brightness — яркость сцены по данным камеры (EXIF BrightnessValue, шкала APEX):
 ///   примерно −3 и ниже — темно, 0 — полумрак, 2…5 — комната со светом, 7+ — улица днём.
 ///   NaN — камера не сообщила яркость;
-/// • body — плечи, если на этом кадре их искали и нашли;
-/// • bodyChecked — искали ли плечи на этом кадре (их ищут через кадр).
-typealias CameraFrame = (hands: [CameraHand], brightness: Double, body: CameraBody?, bodyChecked: Bool)
+/// • body — плечи, если их нашли (ищутся на каждом кадре, как и руки).
+typealias CameraFrame = (hands: [CameraHand], brightness: Double, body: CameraBody?)
 
 /// Блоки структурной схемы: «Камера → Получение видеокадров → Обнаружение руки → Определение ключевых точек».
 final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
@@ -65,7 +64,6 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     /// Поиск плеч (Apple Vision, `VNDetectHumanBodyPoseRequest`). Запрос переиспользуется (только на videoQueue).
     private let bodyPoseRequest = VNDetectHumanBodyPoseRequest()
-    private var frameIndex = 0
     private let bodyLock = NSLock()
     private var bodyTrackingEnabled = true
     /// Как повернуть кадр, чтобы человек на нём стоял прямо. nil — пока неизвестно.
@@ -201,17 +199,11 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             brightness = value
         }
 
-        // Плечи двигаются медленно: ищем их через кадр, чтобы не снижать частоту кадров.
-        frameIndex += 1
+        // Плечи ищем на каждом кадре — так же, как руки, чтобы они двигались вместе с человеком.
         bodyLock.lock()
         let orientation = bodyTrackingEnabled ? bodyOrientation : nil
         bodyLock.unlock()
-        var body: CameraBody?
-        var bodyChecked = false
-        if let orientation, frameIndex % 2 == 0 {
-            bodyChecked = true
-            body = detectBody(in: sampleBuffer, orientation: orientation)
-        }
+        let body = orientation.flatMap { detectBody(in: sampleBuffer, orientation: $0) }
 
         let request = handPoseRequest
 
@@ -219,7 +211,7 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         do {
             try handler.perform([request])
             guard let observations = request.results, !observations.isEmpty else {
-                continuation.yield((hands: [], brightness: brightness, body: body, bodyChecked: bodyChecked))   // рук нет в кадре
+                continuation.yield((hands: [], brightness: brightness, body: body))   // рук нет в кадре
                 return
             }
 
@@ -256,9 +248,9 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 }
                 hands.append((points: points, confidence: confidence, chirality: chirality))
             }
-            continuation.yield((hands: hands, brightness: brightness, body: body, bodyChecked: bodyChecked))
+            continuation.yield((hands: hands, brightness: brightness, body: body))
         } catch {
-            continuation.yield((hands: [], brightness: brightness, body: body, bodyChecked: bodyChecked))
+            continuation.yield((hands: [], brightness: brightness, body: body))
         }
     }
 

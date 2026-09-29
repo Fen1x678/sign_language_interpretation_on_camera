@@ -75,6 +75,9 @@ final class GestureViewModel: ObservableObject {
     var isHandDetected: Bool { handCount > 0 }
     /// Плечи найдены: положение рук относительно тела учитывается.
     @Published private(set) var isBodyDetected = false
+    /// Подсказка в режиме «Перевод»: на какое слово похоже то, что сейчас в кадре, и насколько.
+    @Published private(set) var hint: String?
+    private var lastHintUpdate: Double = 0
     @Published private(set) var currentSign: Sign = .none
     @Published private(set) var cameraError: String?
     @Published private(set) var notice: String?
@@ -122,7 +125,7 @@ final class GestureViewModel: ObservableObject {
     // MARK: Плечи
     /// Плечи в координатах экрана, слева направо (сглажены). Пусто — не найдены.
     private var shoulderPoints: [CGPoint] = []
-    private var shouldersSeenAt: Double = -.infinity
+    private var shoulderSmoother = ShoulderSmoother()
     private var bodyTrackingConfigured = false
     private var bodyTrackingEnabled = false
     private var bodyOrientation: CGImagePropertyOrientation?
@@ -214,6 +217,7 @@ final class GestureViewModel: ObservableObject {
             live.handPoints = []
             mainHistory.removeAll()
             shoulderPoints = []
+            shoulderSmoother.reset()
             bodyTrackingConfigured = false
             smoother.reset()
             sceneBrightness = nil
@@ -321,9 +325,14 @@ final class GestureViewModel: ObservableObject {
             break
         }
 
-        guard isRecognitionEnabled else { return }
+        guard isRecognitionEnabled else {
+            if hint != nil { hint = nil }
+            return
+        }
+        defer { updateHint(now: now) }
 
         if mode == .translate {
+            library.resetCandidate()
             // Руки опущены — фраза закончена.
             if geometries.isEmpty, !phraseWords.isEmpty, now - lastHandSeenTime > phrasePause {
                 finishPhrase()
@@ -339,8 +348,21 @@ final class GestureViewModel: ObservableObject {
         apply(result)
     }
 
-    /// Плечи в координатах экрана. Их ищет камера (через кадр); здесь они сглаживаются
-    /// и удерживаются 0,6 с, если на кадре их не нашли (например, рука на мгновение закрыла плечо).
+    /// Подсказка под жестом: на какое слово похоже то, что сейчас в кадре, и насколько (100% — достаточно
+    /// для распознавания). Помогает понять, почему слово не засчитывается и нужно ли сдвинуть «Чувствительность».
+    private func updateHint(now: Double) {
+        guard now - lastHintUpdate >= 0.25 else { return }
+        lastHintUpdate = now
+        var text: String?
+        if mode == .translate, currentSign == .none, isHandDetected, let candidate = library.lastCandidate {
+            let percent = Int((max(0, min(1, 2 - candidate.ratio)) * 100).rounded())
+            if percent >= 20 { text = "Похоже на «\(candidate.word)» — \(percent)%" }
+        }
+        if hint != text { hint = text }
+    }
+
+    /// Плечи в координатах экрана. Камера ищет их на каждом кадре; здесь они сглаживаются
+    /// тем же фильтром, что и точки рук, и следуют за человеком так же быстро.
     private func updateShoulders(_ frame: CameraFrame, now: Double) -> [CGPoint] {
         guard let layer = previewLayer else { return [] }
 
@@ -355,23 +377,15 @@ final class GestureViewModel: ObservableObject {
             camera.configureBodyTracking(enabled: enabled, orientation: orientation)
         }
 
-        if !enabled {
-            shoulderPoints = []
-        } else if let found = frame.body, found.shoulders.count == 2 {
-            let points = found.shoulders
-                .map { layer.layerPointConverted(fromCaptureDevicePoint: $0) }
-                .sorted { $0.x < $1.x }
-            let width = dist(points[0], points[1])
-            if shoulderPoints.count == 2, dist(shoulderPoints[0], points[0]) < width * 0.5 {
-                // Сглаживаем: плечи почти не двигаются, а точки Vision слегка дрожат.
-                shoulderPoints = zip(shoulderPoints, points).map { old, new in
-                    CGPoint(x: old.x * 0.5 + new.x * 0.5, y: old.y * 0.5 + new.y * 0.5)
-                }
-            } else {
-                shoulderPoints = points
+        if enabled {
+            let found = frame.body.map { body in
+                body.shoulders
+                    .map { layer.layerPointConverted(fromCaptureDevicePoint: $0) }
+                    .sorted { $0.x < $1.x }
             }
-            shouldersSeenAt = now
-        } else if now - shouldersSeenAt > 0.6 {
+            shoulderPoints = shoulderSmoother.smooth(found, time: now)
+        } else {
+            shoulderSmoother.reset()
             shoulderPoints = []
         }
 

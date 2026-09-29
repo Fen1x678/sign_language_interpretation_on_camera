@@ -31,9 +31,12 @@ struct FrameFeatures {
         w += [1.05, 1.5, 1.5, 1.5]                         // разведение пальцев
         w += [1.5, 1.5, 1.5, 1.5]                          // большой палец → кончики
         w += [1.5, 1.5, 1.5, 1.5, 1.5]                     // вытянутость пальцев
-        w += [0.4]                                         // сторона ладони
+        // Сторона ладони — с маленьким весом: она зависит от того, правильно ли Vision определил,
+        // какая это рука, и одна его ошибка не должна ломать распознавание. Этого веса хватает,
+        // чтобы отличать ладонь от тыльной стороны, когда всё остальное совпадает.
+        w += [0.03]                                        // сторона ладони
         w += [0.6, 0.6]                                    // направление кисти
-        w += [2.5, 2.5]                                    // положение относительно плеч
+        w += [1.5, 1.5]                                    // положение относительно плеч
         return w
     }()
 
@@ -261,8 +264,11 @@ struct FrameFeatures {
 
 enum SignMatching {
     /// Базовые пороги сходства (для слова с одной записью, при средней чувствительности).
-    static let basePoseThreshold: Float = 0.10
-    static let baseMotionThreshold: Float = 0.11
+    static let basePoseThreshold: Float = 0.12
+    static let baseMotionThreshold: Float = 0.13
+    /// Во сколько раз дороже зеркальный вариант, если известно, что жест показан той же рукой, что записан
+    /// (и наоборот). Не запрет, а штраф: если Vision ошибся с рукой, жест всё равно узнаётся.
+    static let wrongHandPenalty: Float = 1.25
     /// Порог для слова не больше базового × это число, даже если записи сильно разные.
     static let maxThresholdGrowth: Float = 1.6
     /// Если второе по сходству слово похоже почти так же (в пределах этого множителя), жест не засчитывается.
@@ -435,18 +441,20 @@ struct MotionTemplate {
     ///   (неподвижная рука не должна совпадать с жестом с движением).
     func cost(on stream: MotionStream, abandonAbove: Float = .infinity) -> Float {
         guard stream.handCount == handCount else { return .infinity }
-        let candidates: [[FrameFeatures]]
-        if chirality != 0 && stream.chirality != 0 {
-            // Известно, какой рукой записан и показан жест: сравниваем только подходящий вариант,
-            // поэтому жесты «влево» и «вправо» не путаются.
-            candidates = [chirality == stream.chirality ? stream.frames : stream.mirrored]
-        } else {
-            candidates = [stream.frames, stream.mirrored]
-        }
+        // Если известно, какой рукой записан и показан жест, «неподходящий» вариант (обычный или зеркальный)
+        // дороже: так жесты «влево» и «вправо» не путаются, а ошибка Vision с рукой не ломает распознавание.
+        let known = chirality != 0 && stream.chirality != 0
+        let same = chirality == stream.chirality
+        let penalty = SignMatching.wrongHandPenalty
+        let candidates: [(frames: [FrameFeatures], penalty: Float)] = !known
+            ? [(stream.frames, 1), (stream.mirrored, 1)]
+            : (same ? [(stream.frames, 1), (stream.mirrored, penalty)]
+                    : [(stream.mirrored, 1), (stream.frames, penalty)])
         var best = Float.infinity
-        for frames in candidates {
-            let (cost, start) = SignMatching.subsequenceDTW(template: self.frames, stream: frames,
-                                                            abandonAbove: min(best, abandonAbove))
+        for (frames, extra) in candidates {
+            let (raw, start) = SignMatching.subsequenceDTW(template: self.frames, stream: frames,
+                                                           abandonAbove: min(best, abandonAbove) / extra)
+            let cost = raw * extra
             guard cost < best else { continue }
             let segment = frames.count - start
             if Float(segment) < 0.5 * Float(self.frames.count) { continue }
