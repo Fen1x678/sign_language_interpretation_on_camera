@@ -28,6 +28,8 @@ final class LiveState: ObservableObject {
     @Published var fps = 0
     /// Плечи в координатах экрана (две точки или пусто) — для отрисовки.
     @Published var shoulders: [CGPoint] = []
+    /// Для каждой руки из `handPoints`: рука опущена и не учитывается (рисуется серым).
+    @Published var resting: [Bool] = []
 }
 
 /// Кадр для жестов с движением: все руки в кадре и отдельно ведущая (движущаяся) рука.
@@ -78,7 +80,10 @@ final class GestureViewModel: ObservableObject {
     // MARK: Результат распознавания
     /// Скелет рук, прогресс удержания и FPS — меняются на каждом кадре.
     let live = LiveState()
+    /// Сколько рук учитывается в распознавании (опущенная вторая рука не считается).
     @Published private(set) var handCount = 0
+    /// В кадре есть опущенная рука, которая не учитывается.
+    @Published private(set) var hasRestingHand = false
     var isHandDetected: Bool { handCount > 0 }
     /// Плечи найдены: положение рук относительно тела учитывается.
     @Published private(set) var isBodyDetected = false
@@ -150,6 +155,8 @@ final class GestureViewModel: ObservableObject {
 
     // MARK: Движение рук
     private var smoother = HandSmoother()
+    /// Опущенная (лежащая) вторая рука не участвует в распознавании.
+    private var restingFilter = RestingHandFilter()
     private var motionBuffer: [(time: Double, item: MotionSample)] = []
     /// Центры рук за последние доли секунды — для скорости каждой руки.
     private var centerHistory: [(time: Double, centers: [CGPoint])] = []
@@ -241,6 +248,7 @@ final class GestureViewModel: ObservableObject {
             shoulderSmoother.reset()
             bodyTrackingConfigured = false
             smoother.reset()
+            restingFilter.reset()
             sceneBrightness = nil
             resetRecognition()
             if wasLightOn { setLight(true) }
@@ -286,6 +294,9 @@ final class GestureViewModel: ObservableObject {
             live.handPoints = []
             live.shoulders = []
             if handCount != 0 { handCount = 0 }
+            if hasRestingHand { hasRestingHand = false }
+            live.resting = []
+            restingFilter.reset()
         } else {
             // Страница речи переключала звук на запись — возвращаем озвучку перевода.
             try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
@@ -333,15 +344,9 @@ final class GestureViewModel: ObservableObject {
         }
         samples = smoother.smooth(samples, time: now)
 
-        // Для рисования скелета — только уверенно найденные точки.
-        let screenHands = samples.map { $0.thresholded() }
-        if handCount != screenHands.count { handCount = screenHands.count }
-        if !(screenHands.isEmpty && live.handPoints.isEmpty) { live.handPoints = screenHands }
-
         // Задняя камера видит собеседника «не в зеркале». Отражаем по горизонтали, чтобы
         // жест выглядел одинаково с обеих камер, а «влево/вправо» считались со стороны жестикулирующего.
-        let recognitionSamples = cameraPosition == .back ? samples.map { $0.flipped(width: width) } : samples
-        let handsForRecognition = recognitionSamples.map { $0.thresholded() }
+        let allRecognitionSamples = cameraPosition == .back ? samples.map { $0.flipped(width: width) } : samples
 
         // Плечи находятся автоматически; относительно них считается, где находятся руки.
         let shoulders = updateShoulders(frame, now: now)
@@ -351,6 +356,24 @@ final class GestureViewModel: ObservableObject {
             body = BodyReference(shoulders: cameraPosition == .back
                                  ? shoulders.map { CGPoint(x: layerWidth - $0.x, y: $0.y) }
                                  : shoulders)
+        }
+
+        // Опущенная неподвижная вторая рука (на столе, на коленях) не учитывается,
+        // пока не поднимется или не начнёт двигаться.
+        let viewHeight = previewLayer?.bounds.height ?? 0
+        let active = restingFilter.update(allRecognitionSamples, body: body, viewHeight: viewHeight, time: now)
+        let recognitionSamples = zip(allRecognitionSamples, active).filter { $0.1 }.map { $0.0 }
+        let handsForRecognition = recognitionSamples.map { $0.thresholded() }
+
+        // Для рисования скелета — только уверенно найденные точки; опущенная рука — серым.
+        let screenHands = samples.map { $0.thresholded() }
+        if handCount != recognitionSamples.count { handCount = recognitionSamples.count }
+        let resting = active.count > recognitionSamples.count
+        if hasRestingHand != resting { hasRestingHand = resting }
+        if !(screenHands.isEmpty && live.handPoints.isEmpty) {
+            live.handPoints = screenHands
+            let restingFlags = active.map { !$0 }
+            if live.resting != restingFlags { live.resting = restingFlags }
         }
 
         let geometries = handsForRecognition.compactMap { HandGeometry(points: $0) }
