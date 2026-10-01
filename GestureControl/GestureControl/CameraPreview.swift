@@ -44,6 +44,7 @@ struct HandOverlay: View {
 
     var body: some View {
         let allHands = live.handPoints
+        let resting = live.resting
         let shoulders = live.shoulders
         let bones = Self.bones
         let color: Color = isActive ? .green : .yellow
@@ -60,19 +61,23 @@ struct HandOverlay: View {
                 context.fill(Path(ellipseIn: rect), with: .color(color))
             }
           }
-          for pts in allHands where pts.count == 21 {
+          for (h, pts) in allHands.enumerated() where pts.count == 21 {
+            // Опущенная рука не учитывается — рисуем её серым.
+            let isResting = h < resting.count && resting[h]
             var path = Path()
             for (a, b) in bones where pts[a].x >= 0 && pts[b].x >= 0 {
                 path.move(to: pts[a])
                 path.addLine(to: pts[b])
             }
-            context.stroke(path, with: .color(.white.opacity(0.85)), lineWidth: 3)
+            let boneColor: Color = isResting ? Color.gray.opacity(0.6) : Color.white.opacity(0.85)
+            context.stroke(path, with: .color(boneColor), lineWidth: 3)
 
+            let jointColor: Color = isResting ? Color.gray : color
             for (i, point) in pts.enumerated() where point.x >= 0 {
                 let isTip = [4, 8, 12, 16, 20].contains(i)
                 let r: CGFloat = isTip ? 7 : 5
                 let rect = CGRect(x: point.x - r, y: point.y - r, width: r * 2, height: r * 2)
-                context.fill(Path(ellipseIn: rect), with: .color(color))
+                context.fill(Path(ellipseIn: rect), with: .color(jointColor))
             }
           }
         }
