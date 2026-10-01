@@ -170,6 +170,7 @@ private fun TopBar(vm: GestureViewModel, onHelp: () -> Unit) {
         val status = when {
             vm.handCount >= 2 -> "Две руки"
             vm.isHandDetected -> "Рука в кадре"
+            vm.hasRestingHand -> "Руки опущены"
             else -> "Нет руки"
         }
         Row(

@@ -77,16 +77,21 @@ fun HandOverlay(live: LiveState, isActive: Boolean, modifier: Modifier = Modifie
             drawLine(line, shoulders[0].offset(), shoulders[1].offset(), strokeWidth = 3.dp.toPx(), cap = StrokeCap.Round)
             for (p in shoulders) drawCircle(color, radius = 7.dp.toPx(), center = p.offset())
         }
-        for (pts in live.handPoints) {
-            if (pts.size != 21) continue
+        val resting = live.resting
+        live.handPoints.forEachIndexed { h, pts ->
+            if (pts.size != 21) return@forEachIndexed
+            // Опущенная рука не учитывается — рисуем её серым.
+            val isResting = resting.getOrElse(h) { false }
+            val bones = if (isResting) Color.Gray.copy(alpha = 0.6f) else line
+            val joints = if (isResting) Color.Gray else color
             for ((a, b) in BONES) {
                 if (!pts[a].isValid || !pts[b].isValid) continue
-                drawLine(line, pts[a].offset(), pts[b].offset(), strokeWidth = 3.dp.toPx(), cap = StrokeCap.Round)
+                drawLine(bones, pts[a].offset(), pts[b].offset(), strokeWidth = 3.dp.toPx(), cap = StrokeCap.Round)
             }
             pts.forEachIndexed { i, p ->
                 if (!p.isValid) return@forEachIndexed
                 val r = if (i in TIPS) 7.dp.toPx() else 5.dp.toPx()
-                drawCircle(color, radius = r, center = p.offset())
+                drawCircle(joints, radius = r, center = p.offset())
             }
         }
     }

@@ -27,6 +27,7 @@ import com.fen1x.speech.core.MotionSpotter
 import com.fen1x.speech.core.MotionStream
 import com.fen1x.speech.core.Pt
 import com.fen1x.speech.core.RecognitionResult
+import com.fen1x.speech.core.RestingHandFilter
 import com.fen1x.speech.core.ShoulderSmoother
 import com.fen1x.speech.core.Sign
 import com.fen1x.speech.core.SignFrame
@@ -79,6 +80,8 @@ class LiveState {
     var fps by mutableIntStateOf(0)
     /** Плечи в dp экрана (две точки или пусто) — для отрисовки. */
     var shoulders by mutableStateOf<List<Pt>>(emptyList())
+    /** Для каждой руки из [handPoints]: рука опущена и не учитывается (рисуется серым). */
+    var resting by mutableStateOf<List<Boolean>>(emptyList())
 }
 
 /** Кадр для жестов с движением: все руки в кадре и отдельно ведущая (движущаяся) рука. */
@@ -101,7 +104,11 @@ class GestureViewModel(app: Application) : AndroidViewModel(app) {
     // MARK: Результат распознавания
     /** Скелет рук, прогресс удержания и FPS — меняются на каждом кадре. */
     val live = LiveState()
+    /** Сколько рук учитывается в распознавании (опущенная вторая рука не считается). */
     var handCount by mutableIntStateOf(0)
+        private set
+    /** В кадре есть опущенная рука, которая не учитывается. */
+    var hasRestingHand by mutableStateOf(false)
         private set
     val isHandDetected: Boolean get() = handCount > 0
     /** Плечи найдены: положение рук относительно тела учитывается. */
@@ -188,6 +195,8 @@ class GestureViewModel(app: Application) : AndroidViewModel(app) {
 
     // MARK: Движение рук
     private val smoother = HandSmoother()
+    /** Опущенная (лежащая) вторая рука не участвует в распознавании. */
+    private val restingFilter = RestingHandFilter()
     private val motionBuffer = ArrayList<Timed<MotionSample>>()
     /** Центры рук за последние доли секунды — для скорости каждой руки. */
     private val centerHistory = ArrayList<Timed<List<Pt>>>()
@@ -335,6 +344,7 @@ class GestureViewModel(app: Application) : AndroidViewModel(app) {
         shoulderPoints = emptyList()
         shoulderSmoother.reset()
         smoother.reset()
+        restingFilter.reset()
         sceneBrightness = null
         resetRecognition()
         haptic(Haptic.LIGHT)
@@ -370,6 +380,8 @@ class GestureViewModel(app: Application) : AndroidViewModel(app) {
             live.handPoints = emptyList()
             live.shoulders = emptyList()
             handCount = 0
+            hasRestingHand = false
+            restingFilter.reset()
         } else if (lightMode == LightMode.ON && isAppActive) {
             setLight(true)
         }
@@ -416,21 +428,31 @@ class GestureViewModel(app: Application) : AndroidViewModel(app) {
         }
         samples = smoother.smooth(samples, now)
 
-        // Для рисования скелета — только уверенно найденные точки.
-        val screenHands = samples.map { it.thresholded() }
-        if (handCount != screenHands.size) handCount = screenHands.size
-        if (!(screenHands.isEmpty() && live.handPoints.isEmpty())) live.handPoints = screenHands
-
         // Задняя камера видит собеседника «не в зеркале». Отражаем по горизонтали, чтобы
         // жест выглядел одинаково с обеих камер, а «влево/вправо» считались со стороны жестикулирующего.
-        val recognitionSamples = if (!isFront) samples.map { it.flipped(width) } else samples
-        val handsForRecognition = recognitionSamples.map { it.thresholded() }
+        val allRecognitionSamples = if (!isFront) samples.map { it.flipped(width) } else samples
 
         // Плечи находятся автоматически; относительно них считается, где находятся руки.
         val shoulders = updateShoulders(frame, now)
         var body: BodyReference? = null
         if (shoulders.size == 2) {
             body = BodyReference.from(if (!isFront) shoulders.map { Pt(width - it.x, it.y) } else shoulders)
+        }
+
+        // Опущенная неподвижная вторая рука (на столе, на коленях) не учитывается,
+        // пока не поднимется или не начнёт двигаться.
+        val active = restingFilter.update(allRecognitionSamples, body, height, now)
+        val recognitionSamples = allRecognitionSamples.filterIndexed { i, _ -> active[i] }
+        val handsForRecognition = recognitionSamples.map { it.thresholded() }
+
+        // Для рисования скелета — только уверенно найденные точки; опущенная рука — серым.
+        val screenHands = samples.map { it.thresholded() }
+        if (handCount != recognitionSamples.size) handCount = recognitionSamples.size
+        val resting = active.size > recognitionSamples.size
+        if (hasRestingHand != resting) hasRestingHand = resting
+        if (!(screenHands.isEmpty() && live.handPoints.isEmpty())) {
+            live.handPoints = screenHands
+            live.resting = active.map { !it }
         }
 
         val geometries = handsForRecognition.mapNotNull { HandGeometry.from(it) }
