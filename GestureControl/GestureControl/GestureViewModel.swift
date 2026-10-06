@@ -157,6 +157,8 @@ final class GestureViewModel: ObservableObject {
     private var smoother = HandSmoother()
     /// Опущенная (лежащая) вторая рука не участвует в распознавании.
     private var restingFilter = RestingHandFilter()
+    /// Поза распознаётся, только когда форма кисти устоялась (не в момент перехода между жестами).
+    private var poseSteadiness = PoseSteadiness()
     private var motionBuffer: [(time: Double, item: MotionSample)] = []
     /// Центры рук за последние доли секунды — для скорости каждой руки.
     private var centerHistory: [(time: Double, centers: [CGPoint])] = []
@@ -315,6 +317,7 @@ final class GestureViewModel: ObservableObject {
     private func resetRecognition() {
         recognizer.reset()
         spotter.reset()
+        poseSteadiness.reset()
         motionBuffer.removeAll()
         currentSign = .none
         live.holdProgress = 0
@@ -439,8 +442,9 @@ final class GestureViewModel: ObservableObject {
         }
 
         let poseFeatures = poseVariants.map(FrameFeatures.init)
+        let steady = poseSteadiness.update(poseFeatures.first, time: now)
         let result = recognizer.process(hands: handsForRecognition, time: now) { hands in
-            self.classifyStatic(hands, variants: poseFeatures)
+            self.classifyStatic(hands, variants: poseFeatures, steady: steady)
         }
         apply(result)
     }
@@ -617,10 +621,11 @@ final class GestureViewModel: ObservableObject {
     /// Статичный жест.
     /// «Перевод»: только жесты из словаря пользователя.
     /// «Управление»: встроенные жесты.
-    private func classifyStatic(_ hands: [HandGeometry], variants: [FrameFeatures]) -> Sign {
+    private func classifyStatic(_ hands: [HandGeometry], variants: [FrameFeatures], steady: Bool) -> Sign {
         switch mode {
         case .translate:
-            guard !variants.isEmpty else { return .none }
+            // Пальцы ещё меняют положение (переход между жестами) — позу не распознаём.
+            guard !variants.isEmpty, steady else { return .none }
             var sticky: UUID?
             if case .custom(let id, _) = currentSign { sticky = id }
             if let sign = library.classifyPose(variants, sticky: sticky) {

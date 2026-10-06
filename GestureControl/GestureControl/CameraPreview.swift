@@ -47,15 +47,17 @@ struct HandOverlay: View {
         let resting = live.resting
         let shoulders = live.shoulders
         let bones = Self.bones
-        let color: Color = isActive ? .green : .yellow
+        // Мягкие цвета: мятный — жест узнан, янтарный — рука в кадре.
+        let color: Color = isActive ? Soft.ok : Soft.warm
+        let line = StrokeStyle(lineWidth: 3.5, lineCap: .round, lineJoin: .round)
 
         Canvas { context, _ in
           // Плечи — так же, как точки рук: линия между плечами и две точки.
           if shoulders.count == 2 {
-            var line = Path()
-            line.move(to: shoulders[0])
-            line.addLine(to: shoulders[1])
-            context.stroke(line, with: .color(.white.opacity(0.85)), lineWidth: 3)
+            var shoulderLine = Path()
+            shoulderLine.move(to: shoulders[0])
+            shoulderLine.addLine(to: shoulders[1])
+            context.stroke(shoulderLine, with: .color(.white.opacity(0.7)), style: line)
             for point in shoulders {
                 let rect = CGRect(x: point.x - 7, y: point.y - 7, width: 14, height: 14)
                 context.fill(Path(ellipseIn: rect), with: .color(color))
@@ -69,10 +71,10 @@ struct HandOverlay: View {
                 path.move(to: pts[a])
                 path.addLine(to: pts[b])
             }
-            let boneColor: Color = isResting ? Color.gray.opacity(0.6) : Color.white.opacity(0.85)
-            context.stroke(path, with: .color(boneColor), lineWidth: 3)
+            let boneColor: Color = isResting ? Color.gray.opacity(0.5) : Color.white.opacity(0.7)
+            context.stroke(path, with: .color(boneColor), style: line)
 
-            let jointColor: Color = isResting ? Color.gray : color
+            let jointColor: Color = isResting ? Color.gray.opacity(0.8) : color
             for (i, point) in pts.enumerated() where point.x >= 0 {
                 let isTip = [4, 8, 12, 16, 20].contains(i)
                 let r: CGFloat = isTip ? 7 : 5

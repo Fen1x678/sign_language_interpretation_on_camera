@@ -30,6 +30,109 @@ final class SpeechMeter: ObservableObject {
     }
 }
 
+/// Усиление тихой и дальней речи.
+///
+/// Голос человека в 10 метрах доходит до микрофона примерно на 20 дБ тише, чем с 1 метра,
+/// а низкий гул (вентиляция, транспорт) при этом почти не ослабевает. Поэтому:
+/// 1. фильтр высоких частот убирает гул ниже ~100 Гц (в нём нет речи);
+/// 2. автоматическая регулировка громкости поднимает тихую речь до обычной громкости
+///    (до +24 дБ), но фоновый шум не поднимает громче −38 дБ, а громкую речь вблизи не трогает;
+/// 3. ограничитель не даёт звуку «захрипеть», если кто-то заговорит громко.
+/// Работает только на аудиопотоке (внутри блокировки `AudioSink`).
+private struct SpeechEnhancer {
+    /// Желаемая громкость речи, дБ.
+    static let target: Float = -20
+    /// Наибольшее усиление, дБ (в 16 раз).
+    static let maxGain: Float = 24
+    /// Фоновый шум не поднимаем громче этого, дБ.
+    static let noiseCeiling: Float = -38
+    /// Частота среза фильтра гула, Гц.
+    static let cutoff: Double = 100
+
+    /// Текущее усиление, дБ.
+    private(set) var gain: Float = 0
+    /// Громкость речи (огибающая громких мест), дБ.
+    private var speechLevel: Float = -40
+    private var sampleRate: Double = 0
+    private var b0: Float = 1, b1: Float = 0, b2: Float = 0, a1: Float = 0, a2: Float = 0
+    private var states: [(x1: Float, x2: Float, y1: Float, y2: Float)] = []
+
+    mutating func reset() {
+        gain = 0
+        speechLevel = -40
+        sampleRate = 0
+        states = []
+    }
+
+    /// Обрабатывает буфер на месте. Возвращает false, если формат не подходит (буфер не изменён).
+    mutating func process(_ buffer: AVAudioPCMBuffer, noise: Float, seconds: Double) -> Bool {
+        guard let data = buffer.floatChannelData, buffer.frameLength > 0 else { return false }
+        let channels = Int(buffer.format.channelCount)
+        guard channels >= 1, !(buffer.format.isInterleaved && channels > 1) else { return false }
+        let frames = Int(buffer.frameLength)
+        if buffer.format.sampleRate != sampleRate { configure(sampleRate: buffer.format.sampleRate) }
+        if states.count != channels { states = Array(repeating: (x1: 0, x2: 0, y1: 0, y2: 0), count: channels) }
+
+        // 1. Фильтр высоких частот (биквад Баттерворта 2-го порядка).
+        for channel in 0..<channels {
+            let samples = data[channel]
+            var s = states[channel]
+            for i in 0..<frames {
+                let x = samples[i]
+                let y = b0 * x + b1 * s.x1 + b2 * s.x2 - a1 * s.y1 - a2 * s.y2
+                s.x2 = s.x1
+                s.x1 = x
+                s.y2 = s.y1
+                s.y1 = y
+                samples[i] = y
+            }
+            states[channel] = s
+        }
+
+        // 2. Громкость речи: быстро растёт на словах, медленно (6 дБ/с) спадает в паузах.
+        var rms: Float = 0
+        vDSP_rmsqv(data[0], 1, &rms, vDSP_Length(frames))
+        let decibels = 20 * log10(max(rms, 0.000_000_1))
+        if decibels > speechLevel {
+            speechLevel += (decibels - speechLevel) * 0.5
+        } else {
+            speechLevel = max(speechLevel - Float(6 * seconds), noise + 6)
+        }
+        var desired = min(Self.maxGain, Self.target - speechLevel)
+        desired = min(desired, Self.noiseCeiling - noise)
+        desired = max(desired, 0)
+        // Усиление уменьшается сразу (чтобы не было перегрузки), а растёт плавно — 3 дБ/с.
+        gain = desired < gain ? desired : min(desired, gain + Float(3 * seconds))
+
+        // 3. Усиление и ограничитель.
+        if gain > 0.1 {
+            var factor = powf(10, gain / 20)
+            var low: Float = -0.98
+            var high: Float = 0.98
+            for channel in 0..<channels {
+                let samples = data[channel]
+                vDSP_vsmul(samples, 1, &factor, samples, 1, vDSP_Length(frames))
+                vDSP_vclip(samples, 1, &low, &high, samples, 1, vDSP_Length(frames))
+            }
+        }
+        return true
+    }
+
+    private mutating func configure(sampleRate rate: Double) {
+        sampleRate = rate
+        let w0 = 2 * Double.pi * Self.cutoff / max(rate, 1)
+        let alpha = sin(w0) / (2 * 0.7071)
+        let cosw = cos(w0)
+        let a0 = 1 + alpha
+        b0 = Float((1 + cosw) / 2 / a0)
+        b1 = Float(-(1 + cosw) / a0)
+        b2 = Float((1 + cosw) / 2 / a0)
+        a1 = Float(-2 * cosw / a0)
+        a2 = Float((1 - alpha) / a0)
+        states = []
+    }
+}
+
 /// Звук с микрофона. Вызывается с аудиопотока, поэтому всё защищено блокировкой.
 ///
 /// • Весь звук передаётся в текущий запрос распознавания — и в тишине тоже. Решать, есть ли речь,
@@ -48,13 +151,17 @@ private final class AudioSink: @unchecked Sendable {
         var silence: TimeInterval
         /// Секунд с последнего настоящего звука (не цифровой тишины из одних нулей).
         var soundSilence: TimeInterval
+        /// Насколько сейчас усилен звук (дБ), если включено усиление тихой и дальней речи.
+        var gain: Float
 
-        /// Для индикатора: 0…1, громкость от −65 до −15 дБ.
-        var meterLevel: Double { Double(min(max((level + 65) / 50, 0), 1)) }
+        /// Для индикатора: 0…1, громкость (с усилением — так, как её слышит распознавание) от −65 до −15 дБ.
+        var meterLevel: Double { Double(min(max((level + gain + 65) / 50, 0), 1)) }
     }
 
     /// Для индикатора: голос — звук громче фонового шума на столько децибел не меньше 60 мс подряд.
     private static let voiceMargin: Float = 8
+    /// С усилением дальней речи голос ищем чутче: человек в 10 метрах громче шума всего на несколько дБ.
+    private static let distantVoiceMargin: Float = 5
     private static let voiceDuration = 0.06
     private static let prerollSeconds = 1.0
     /// Фоновый шум — минимум громкости за 16 отрезков по 0,25 с (4 с): в речи всегда есть
@@ -76,6 +183,16 @@ private final class AudioSink: @unchecked Sendable {
     private var loudTime: TimeInterval = 0
     private var lastVoice: TimeInterval = 0
     private var lastSound: TimeInterval = 0
+    private var enhance = true
+    private var enhancer = SpeechEnhancer()
+
+    /// Включить или выключить усиление тихой и дальней речи.
+    func setEnhance(_ on: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        enhance = on
+        enhancer.reset()
+    }
 
     /// Новый запрос распознавания (nil — запроса пока нет). Запас звука сразу уходит в него.
     func set(_ request: SFSpeechAudioBufferRecognitionRequest?) {
@@ -105,6 +222,7 @@ private final class AudioSink: @unchecked Sendable {
         loudTime = 0
         lastVoice = 0
         lastSound = 0
+        enhancer.reset()
     }
 
     func append(_ buffer: AVAudioPCMBuffer) {
@@ -115,9 +233,16 @@ private final class AudioSink: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         analyze(decibels, seconds: seconds, now: now)
+        // Тихая и дальняя речь: убираем гул и выравниваем громкость (на копии — буфер микрофона не трогаем).
+        var output = buffer
+        var copied = false
+        if enhance, let copy = Self.copy(buffer), enhancer.process(copy, noise: noise, seconds: seconds) {
+            output = copy
+            copied = true
+        }
         if let request {
-            request.append(buffer)
-        } else if let copy = Self.copy(buffer) {
+            request.append(output)
+        } else if let copy = copied ? output : Self.copy(buffer) {
             preroll.append(copy)
             prerollFrames += copy.frameLength
             let limit = AVAudioFrameCount(buffer.format.sampleRate * Self.prerollSeconds)
@@ -134,7 +259,8 @@ private final class AudioSink: @unchecked Sendable {
         let now = ProcessInfo.processInfo.systemUptime
         return Snapshot(level: level, noise: noise,
                         silence: lastVoice > 0 ? now - lastVoice : .infinity,
-                        soundSilence: lastSound > 0 ? now - lastSound : .infinity)
+                        soundSilence: lastSound > 0 ? now - lastSound : .infinity,
+                        gain: enhance ? enhancer.gain : 0)
     }
 
     private func analyze(_ decibels: Float?, seconds: TimeInterval, now: TimeInterval) {
@@ -163,7 +289,8 @@ private final class AudioSink: @unchecked Sendable {
         }
 
         // Голос ищем, когда уровень шума уже известен (через 0,25 с после включения).
-        if !minima.isEmpty && level > noise + Self.voiceMargin {
+        let margin = enhance ? Self.distantVoiceMargin : Self.voiceMargin
+        if !minima.isEmpty && level > noise + margin {
             loudTime += seconds
         } else {
             loudTime = 0
@@ -224,6 +351,21 @@ final class VoiceTranslator: ObservableObject {
     /// быстро сменяют друг друга; длиннее — для медленной речи с паузами внутри фразы.
     @Published var splitPause: Double {
         didSet { UserDefaults.standard.set(splitPause, forKey: Self.splitPauseKey) }
+    }
+    /// Усиление тихой и дальней речи: телефон выравнивает громкость и убирает низкий гул,
+    /// чтобы человек в нескольких метрах распознавался так же, как вблизи.
+    @Published var enhanceDistant: Bool {
+        didSet {
+            UserDefaults.standard.set(enhanceDistant, forKey: Self.enhanceKey)
+            sink.setEnhance(enhanceDistant)
+        }
+    }
+    /// Микрофон Bluetooth (наушники, гарнитура): его можно дать говорящему, который далеко.
+    @Published var bluetoothMic: Bool {
+        didSet {
+            UserDefaults.standard.set(bluetoothMic, forKey: Self.bluetoothKey)
+            restartAudio()
+        }
     }
     /// Распознавать только на телефоне, без отправки звука на серверы Apple
     /// (точность может быть ниже; доступно не на всех iPhone).
@@ -288,10 +430,15 @@ final class VoiceTranslator: ObservableObject {
     private var corrector = SpeechCorrector()
 
     private static let fontSizeKey = "speechFontSize"
+    private static let enhanceKey = "speechEnhanceDistant"
+    private static let bluetoothKey = "speechBluetoothMic"
     private static let splitPauseKey = "speechSplitPause"
     private static let onDeviceKey = "speechOnDeviceOnly"
     private static let wordsKey = "speechCustomWords"
     private static let offlineNotice = "Нет связи с сервером — распознаю на телефоне"
+    private static let bluetoothMissingNotice = "Наушники Bluetooth не подключены — слушаю микрофоном iPhone"
+    /// Выбран микрофон Bluetooth, но наушников нет.
+    private var bluetoothMissing = false
     private static let busyNotice = "Пауза: микрофон занят другим приложением. Продолжу автоматически."
     private static let callStartNotice = "Идёт звонок — пробую слушать разговор…"
     private static let callListeningNotice = "Звонок: слушаю. Включите громкую связь, чтобы телефон слышал и собеседника."
@@ -305,8 +452,11 @@ final class VoiceTranslator: ObservableObject {
         let pause = defaults.double(forKey: Self.splitPauseKey)
         splitPause = pause > 0 ? pause : 1.2
         onDeviceOnly = defaults.bool(forKey: Self.onDeviceKey)
+        enhanceDistant = defaults.object(forKey: Self.enhanceKey) as? Bool ?? true
+        bluetoothMic = defaults.bool(forKey: Self.bluetoothKey)
         customWords = defaults.stringArray(forKey: Self.wordsKey) ?? []
         updateVocabulary()
+        sink.setEnhance(enhanceDistant)
     }
 
     /// Слова из словаря жестов тоже должны распознаваться точно.
@@ -390,11 +540,24 @@ final class VoiceTranslator: ObservableObject {
             if onCall {
                 // Во время звонка — совместный режим: он не прерывает звонок. Даст ли iPhone
                 // микрофон (и настоящий звук, а не тишину) — решает система; итог видно на экране.
-                try session.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers])
+                var options: AVAudioSession.CategoryOptions = [.mixWithOthers]
+                if bluetoothMic { options.insert(.allowBluetooth) }
+                try session.setCategory(.playAndRecord, mode: .default, options: options)
             } else {
-                try session.setCategory(.record, mode: .measurement, options: [.duckOthers])
+                // Микрофон Bluetooth — если выбран: его можно дать говорящему, который далеко.
+                var options: AVAudioSession.CategoryOptions = [.duckOthers]
+                if bluetoothMic { options.insert(.allowBluetooth) }
+                try session.setCategory(.record, mode: .measurement, options: options)
             }
             try session.setActive(true, options: .notifyOthersOnDeactivation)
+            if !onCall {
+                // Наушники Bluetooth — основной микрофон, если подключены; иначе — микрофон iPhone.
+                let headset = bluetoothMic
+                    ? session.availableInputs?.first(where: { $0.portType == .bluetoothHFP })
+                    : nil
+                try? session.setPreferredInput(headset)
+                bluetoothMissing = bluetoothMic && headset == nil
+            }
 
             let input = audioEngine.inputNode
             let format = input.outputFormat(forBus: 0)
@@ -429,7 +592,7 @@ final class VoiceTranslator: ObservableObject {
         running = true
         callMode = onCall
         callModeStart = Date()
-        setNotice(onCall ? Self.callStartNotice : nil)
+        setNotice(onCall ? Self.callStartNotice : (bluetoothMissing ? Self.bluetoothMissingNotice : nil))
         beginPhrase()
         startMonitor()
     }
@@ -553,7 +716,10 @@ final class VoiceTranslator: ObservableObject {
         request.contextualStrings = Array(vocabulary.prefix(100))
         let onDevice = useOnDevice(recognizer)
         if onDevice { request.requiresOnDeviceRecognition = true }
-        if !callMode { setNotice(onDevice && !onDeviceOnly ? Self.offlineNotice : nil) }
+        if !callMode {
+            setNotice(onDevice && !onDeviceOnly ? Self.offlineNotice
+                      : (bluetoothMissing ? Self.bluetoothMissingNotice : nil))
+        }
 
         self.request = request
         phraseStart = Date()

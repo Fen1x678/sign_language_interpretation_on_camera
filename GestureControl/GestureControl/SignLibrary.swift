@@ -374,9 +374,17 @@ final class SignLibrary: ObservableObject {
     private struct Cache {
         /// Кадры поз (прорежены).
         var poses: [FrameFeatures]
-        var poseThreshold: Float
+        /// Порог по разбросу записей самого слова.
+        var ownPoseThreshold: Float
         /// Записи с движением.
         var motions: [MotionTemplate]
+        var ownMotionThreshold: Float
+        /// Самые типичные кадры каждой записи позы — для сравнения с другими словами.
+        var poseMedoids: [FrameFeatures]
+        /// Укороченные записи с движением — для быстрого сравнения с другими словами.
+        var motionProbes: [MotionTemplate]
+        /// Пороги с учётом похожих слов словаря (см. `updateNeighbourLimits`).
+        var poseThreshold: Float
         var motionThreshold: Float
     }
     private var cache: [UUID: Cache] = [:]
@@ -413,6 +421,7 @@ final class SignLibrary: ObservableObject {
         signs[i].poseCounts = counts
         signs[i].recordings += 1
         rebuildCache(for: signs[i])
+        updateNeighbourLimits()
         save()
     }
 
@@ -421,6 +430,7 @@ final class SignLibrary: ObservableObject {
         signs[i].motions.append(frames)
         signs[i].recordings += 1
         rebuildCache(for: signs[i])
+        updateNeighbourLimits()
         save()
     }
 
@@ -428,6 +438,7 @@ final class SignLibrary: ObservableObject {
         for i in offsets { cache[signs[i].id] = nil }
         signs.remove(atOffsets: offsets)
         updateMotionWindow()
+        updateNeighbourLimits()
         save()
     }
 
@@ -622,12 +633,61 @@ final class SignLibrary: ObservableObject {
         let perGroup = max(8, maxPoseFrames / max(1, groups.count))
         let poseGroups = groups.map { SignMatching.evenlySpaced($0, count: perGroup).map(FrameFeatures.init) }
         let motions = sign.motions.compactMap(MotionTemplate.init)
+        let ownPose = Self.poseThreshold(poseGroups)
+        let ownMotion = Self.motionThreshold(motions)
         cache[sign.id] = Cache(poses: poseGroups.flatMap { $0 },
-                               poseThreshold: Self.poseThreshold(poseGroups),
+                               ownPoseThreshold: ownPose,
                                motions: motions,
-                               motionThreshold: Self.motionThreshold(motions))
+                               ownMotionThreshold: ownMotion,
+                               poseMedoids: poseGroups.compactMap { Self.medoid(of: $0) },
+                               motionProbes: sign.motions.compactMap {
+                                   MotionTemplate(SignMatching.evenlySpaced($0, count: Self.probeLength))
+                               },
+                               poseThreshold: ownPose,
+                               motionThreshold: ownMotion)
         updateMotionWindow()
     }
+
+    /// Пороги с учётом соседей: если другое слово словаря похоже на это, порог этого слова
+    /// становится строже (не больше `neighbourShare` расстояния до соседа), чтобы показанное
+    /// «соседнее» слово не засчитывалось как это. Далёкие слова порог не меняют.
+    private func updateNeighbourLimits() {
+        let ids = signs.map(\.id).filter { cache[$0] != nil }
+        for id in ids {
+            guard let c = cache[id] else { continue }
+            var poseMargin = Float.infinity
+            var motionMargin = Float.infinity
+            for otherId in ids where otherId != id {
+                guard let other = cache[otherId] else { continue }
+                // Насколько записи другого слова похожи на это слово (так же, как при распознавании).
+                if !c.poses.isEmpty {
+                    for query in other.poseMedoids {
+                        poseMargin = min(poseMargin, Self.poseCost(query, query.mirrored(), c.poses))
+                    }
+                }
+                if !c.motionProbes.isEmpty {
+                    for query in other.motionProbes {
+                        let stream = MotionStream(query.frames)
+                        for template in c.motionProbes {
+                            motionMargin = min(motionMargin, template.cost(on: stream).cost)
+                        }
+                    }
+                }
+            }
+            cache[id]?.poseThreshold = Self.neighbourLimit(c.ownPoseThreshold, margin: poseMargin,
+                                                           base: SignMatching.basePoseThreshold)
+            cache[id]?.motionThreshold = Self.neighbourLimit(c.ownMotionThreshold, margin: motionMargin,
+                                                             base: SignMatching.baseMotionThreshold)
+        }
+    }
+
+    private static func neighbourLimit(_ own: Float, margin: Float, base: Float) -> Float {
+        guard margin.isFinite else { return own }
+        return min(own, max(base * SignMatching.minThresholdShare, margin * SignMatching.neighbourShare))
+    }
+
+    /// Длина укороченной записи с движением для сравнения слов между собой.
+    private static let probeLength = 12
 
     private func updateMotionWindow() {
         let longest = cache.values.flatMap(\.motions).map(\.frames.count).max() ?? 0
@@ -678,6 +738,7 @@ final class SignLibrary: ObservableObject {
               let saved = try? JSONDecoder().decode([CustomSign].self, from: data) else { return }
         signs = saved
         for sign in signs { rebuildCache(for: sign) }
+        updateNeighbourLimits()
     }
 
     private func save() {
