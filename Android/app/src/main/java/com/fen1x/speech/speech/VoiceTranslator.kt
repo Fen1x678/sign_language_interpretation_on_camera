@@ -2,11 +2,14 @@ package com.fen1x.speech.speech
 
 import android.content.Context
 import android.content.Intent
+import android.media.AudioDeviceInfo
+import android.media.AudioFormat
 import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -37,6 +40,10 @@ data class SpokenPhrase(
  *   когда человек замолчал, — это и есть конец фразы: следующий запрос начинается сразу,
  *   а реплики разных людей оказываются на разных строках.
  * • Нет связи с сервером — распознавание переходит на телефон (Android 12+, если телефон умеет).
+ * • Дальняя речь (Android 13+): микрофон записывает приложение, тихий голос усиливается
+ *   ([AudioPump]) и уходит службе распознавания. Если служба такой звук не принимает —
+ *   сама возвращается к обычному микрофону.
+ * • Микрофон Bluetooth: наушники с микрофоном можно дать говорящему, который далеко.
  * • Приложение свернули — прослушивание на паузе, вернулись — продолжается само.
  * • Текст исправляется [SpeechCorrector]: запинки, повторы, звуки-паузы, слова из словаря.
  */
@@ -64,6 +71,12 @@ class VoiceTranslator(private val context: Context) {
     /** Распознавать только на телефоне, без отправки звука на серверы. */
     var onDeviceOnly by mutableStateOf(prefs.getBoolean(KEY_ON_DEVICE, false))
         private set
+    /** Усиление тихой и дальней речи (Android 13+). */
+    var enhanceDistant by mutableStateOf(prefs.getBoolean(KEY_ENHANCE, true))
+        private set
+    /** Слушать через наушники Bluetooth с микрофоном. */
+    var bluetoothMic by mutableStateOf(prefs.getBoolean(KEY_BLUETOOTH, false))
+        private set
     /** Приглушать звуковой сигнал, который Android подаёт при каждом начале распознавания. */
     var muteBeep by mutableStateOf(prefs.getBoolean(KEY_MUTE, true))
         private set
@@ -72,6 +85,9 @@ class VoiceTranslator(private val context: Context) {
         prefs.getString(KEY_WORDS, "").orEmpty().split('\n').filter { it.isNotBlank() },
     )
         private set
+
+    /** Усиление дальней речи доступно: служба распознавания может получать звук от приложения (Android 13+). */
+    val supportsEnhance: Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
 
     /** Телефон умеет распознавать речь без интернета (Android 12+). */
     val supportsOnDevice: Boolean =
@@ -90,6 +106,28 @@ class VoiceTranslator(private val context: Context) {
     private var fallbackUntil = 0L
     private val mutedStreams = ArrayList<Int>()
     private val restart = Runnable { listen() }
+
+    // Дальняя речь: свой микрофон с усилением.
+    private var pump: AudioPump? = null
+    private var sessionFd: ParcelFileDescriptor? = null
+    private var sessionUsesPump = false
+    private var sessionStart = 0L
+    private var sessionHasText = false
+    private var lastTextChange = 0L
+    private var stopRequestedAt = 0L
+    /** Служба не принимает звук от приложения — до следующего запуска обычный микрофон. */
+    private var enhanceBroken = false
+    private var pumpHeardText = false
+    private var earlyFailures = 0
+    private var silentSessions = 0
+    private var bluetoothActive = false
+    private var bluetoothMissing = false
+    private val ticker = object : Runnable {
+        override fun run() {
+            tick()
+            if (isListening && !pausedInBackground) main.postDelayed(this, TICK_MS)
+        }
+    }
 
     init {
         updateVocabulary()
@@ -114,6 +152,31 @@ class VoiceTranslator(private val context: Context) {
             recognizer?.cancel()
             scheduleRestart(200)
         }
+    }
+
+    fun changeEnhanceDistant(on: Boolean) {
+        enhanceDistant = on
+        prefs.edit().putBoolean(KEY_ENHANCE, on).apply()
+        enhanceBroken = false
+        earlyFailures = 0
+        silentSessions = 0
+        restartSession()
+    }
+
+    fun changeBluetoothMic(on: Boolean) {
+        bluetoothMic = on
+        prefs.edit().putBoolean(KEY_BLUETOOTH, on).apply()
+        updateBluetooth()
+        restartSession()
+    }
+
+    /** Начать новый запрос с новыми настройками звука. */
+    private fun restartSession() {
+        if (!isListening || pausedInBackground) return
+        recognizer?.cancel()
+        endSession()
+        finalize(generation)
+        scheduleRestart(200)
     }
 
     fun changeMuteBeep(on: Boolean) {
@@ -167,8 +230,14 @@ class VoiceTranslator(private val context: Context) {
         isListening = true
         pausedInBackground = false
         failures.clear()
+        enhanceBroken = false
+        pumpHeardText = false
+        earlyFailures = 0
+        silentSessions = 0
         updateMute()
+        updateBluetooth()
         listen()
+        startTicker()
     }
 
     fun permissionDenied() {
@@ -177,15 +246,19 @@ class VoiceTranslator(private val context: Context) {
 
     fun stop() {
         main.removeCallbacks(restart)
+        main.removeCallbacks(ticker)
         isListening = false
         pausedInBackground = false
         recognizer?.cancel()
         recognizer?.destroy()
         recognizer = null
+        endSession()
+        stopPump()
         finalizeAll()
         level = 0f
         notice = null
         updateMute()
+        updateBluetooth()
     }
 
     fun clear() {
@@ -198,10 +271,14 @@ class VoiceTranslator(private val context: Context) {
         if (!isListening) return
         pausedInBackground = true
         main.removeCallbacks(restart)
+        main.removeCallbacks(ticker)
         recognizer?.cancel()
+        endSession()
+        stopPump()
         finalizeAll()
         level = 0f
         updateMute()
+        updateBluetooth()
     }
 
     /** Вернулись в приложение — прослушивание продолжается само. */
@@ -209,7 +286,9 @@ class VoiceTranslator(private val context: Context) {
         if (!isListening || !pausedInBackground) return
         pausedInBackground = false
         updateMute()
+        updateBluetooth()
         listen()
+        startTicker()
     }
 
     // MARK: Распознавание
@@ -228,11 +307,163 @@ class VoiceTranslator(private val context: Context) {
             recognizerOnDevice = onDevice
         }
         generation += 1
-        notice = if (onDevice && !onDeviceOnly) "Нет связи с сервером — распознаю на телефоне" else null
+        // Наушники подключили уже после включения — пробуем снова.
+        if (bluetoothMic && !bluetoothActive) updateBluetooth()
+        endSession()
+        val source = openPumpSession()
+        sessionFd = source
+        sessionUsesPump = source != null
+        sessionStart = now
+        sessionHasText = false
+        lastTextChange = now
+        stopRequestedAt = 0L
+        notice = when {
+            onDevice && !onDeviceOnly -> "Нет связи с сервером — распознаю на телефоне"
+            bluetoothMissing -> "Наушники Bluetooth не подключены — слушаю микрофоном телефона"
+            enhanceBroken -> "Усиление дальней речи на этом телефоне не работает — слушаю обычным микрофоном"
+            else -> null
+        }
         try {
-            current.startListening(intent(onDevice))
+            current.startListening(intent(onDevice, source))
         } catch (e: RuntimeException) {
+            endSession()
             scheduleRestart(500)
+        }
+    }
+
+    /**
+     * Дальняя речь включена — свой микрофон с усилением, канал для нового запроса.
+     * null — обычный микрофон службы распознавания.
+     */
+    private fun openPumpSession(): ParcelFileDescriptor? {
+        if (!supportsEnhance || !enhanceDistant || enhanceBroken) {
+            stopPump()
+            return null
+        }
+        val current = pump ?: AudioPump().also { pump = it }
+        if (!current.isRunning && !current.start()) {
+            // Микрофон сейчас занят — этот запрос через обычный микрофон, следующий попробует снова.
+            stopPump()
+            return null
+        }
+        return current.openSession() ?: run {
+            stopPump()
+            null
+        }
+    }
+
+    private fun stopPump() {
+        pump?.stop()
+        pump = null
+    }
+
+    /** Запрос закончился: канал звука закрывается, звук снова копится в запас. */
+    private fun endSession() {
+        pump?.closeSession()
+        try {
+            sessionFd?.close()
+        } catch (e: java.io.IOException) {
+        }
+        sessionFd = null
+    }
+
+    /** Служба не принимает звук от приложения: обычный микрофон до следующего запуска. */
+    private fun disableEnhance() {
+        enhanceBroken = true
+        recognizer?.cancel()
+        endSession()
+        stopPump()
+        finalize(generation)
+        scheduleRestart(300)
+    }
+
+    private fun startTicker() {
+        main.removeCallbacks(ticker)
+        main.postDelayed(ticker, TICK_MS)
+    }
+
+    /** Каждые 0,1 с: индикатор громкости и конец фразы для звука с усилением. */
+    private fun tick() {
+        if (!isListening || pausedInBackground || !sessionUsesPump) return
+        val current = pump ?: return
+        if (current.failed) {
+            // Микрофон отобрали (звонок) — следующий запрос попробует снова.
+            recognizer?.cancel()
+            endSession()
+            stopPump()
+            finalize(generation)
+            notice = "Микрофон занят (звонок или другое приложение). Продолжу автоматически."
+            scheduleRestart(2000)
+            return
+        }
+        level = current.meterLevel
+        val now = SystemClock.elapsedRealtime()
+        if (stopRequestedAt == 0L) {
+            // Конец фразы — по паузе в распознанном тексте (как на iPhone), не дольше 30 секунд.
+            val textPause = now - lastTextChange
+            if ((sessionHasText && textPause >= (splitPause * 1000).toLong()) || now - sessionStart >= MAX_PHRASE_MS) {
+                stopRequestedAt = now
+                recognizer?.stopListening()
+            }
+        } else if (now - stopRequestedAt >= STOP_TIMEOUT_MS) {
+            // Служба не ответила на «стоп» — начинаем новый запрос сами.
+            recognizer?.cancel()
+            endSession()
+            finalize(generation)
+            scheduleRestart(50)
+        }
+    }
+
+    /** Запрос закончился без текста. Если голос был, а текста нет ни разу — служба не слышит наш звук. */
+    private fun checkSilentSession() {
+        if (!sessionUsesPump || sessionHasText || pumpHeardText) return
+        val voice = pump?.sessionVoiceSeconds ?: 0.0
+        if (voice < 1.5) return
+        silentSessions += 1
+        if (silentSessions >= 3) disableEnhance()
+    }
+
+    /**
+     * Микрофон Bluetooth: наушники с микрофоном становятся микрофоном для распознавания.
+     * Android 12+ — через выбор устройства связи, раньше — через канал SCO.
+     */
+    private fun updateBluetooth() {
+        val audio = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        val want = bluetoothMic && isListening && !pausedInBackground
+        if (want && !bluetoothActive) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val device = audio.availableCommunicationDevices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+                }
+                bluetoothActive = device != null && try {
+                    audio.setCommunicationDevice(device)
+                } catch (e: RuntimeException) {
+                    false
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                bluetoothActive = audio.isBluetoothScoAvailableOffCall && try {
+                    audio.startBluetoothSco()
+                    audio.isBluetoothScoOn = true
+                    true
+                } catch (e: RuntimeException) {
+                    false
+                }
+            }
+            bluetoothMissing = !bluetoothActive
+        } else if (!want) {
+            if (bluetoothActive) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    audio.clearCommunicationDevice()
+                } else {
+                    @Suppress("DEPRECATION")
+                    audio.isBluetoothScoOn = false
+                    @Suppress("DEPRECATION")
+                    audio.stopBluetoothSco()
+                }
+            }
+            bluetoothActive = false
+            bluetoothMissing = false
         }
     }
 
@@ -246,7 +477,7 @@ class VoiceTranslator(private val context: Context) {
         return recognizer
     }
 
-    private fun intent(onDevice: Boolean): Intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+    private fun intent(onDevice: Boolean, source: ParcelFileDescriptor?): Intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
         putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
         putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
@@ -262,6 +493,13 @@ class VoiceTranslator(private val context: Context) {
             putExtra(RecognizerIntent.EXTRA_ENABLE_FORMATTING, RecognizerIntent.FORMATTING_OPTIMIZE_QUALITY)
             val words = vocabulary.take(100)
             if (words.isNotEmpty()) putStringArrayListExtra(RecognizerIntent.EXTRA_BIASING_STRINGS, ArrayList(words))
+            // Звук с усилением дальней речи от приложения вместо микрофона службы.
+            if (source != null) {
+                putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, source)
+                putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
+                putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+                putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, AudioPump.SAMPLE_RATE)
+            }
         }
     }
 
@@ -273,7 +511,8 @@ class VoiceTranslator(private val context: Context) {
         override fun onBeginningOfSpeech() {}
 
         override fun onRmsChanged(rmsdB: Float) {
-            level = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
+            // Со звуком от приложения индикатор показывает громкость с усилением (см. tick).
+            if (!sessionUsesPump) level = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
         }
 
         override fun onBufferReceived(buffer: ByteArray?) {}
@@ -286,6 +525,9 @@ class VoiceTranslator(private val context: Context) {
 
         override fun onResults(results: Bundle?) {
             handleText(results, generation, isFinal = true)
+            if (sessionUsesPump) earlyFailures = 0
+            checkSilentSession()
+            endSession()
             scheduleRestart(50)
         }
 
@@ -308,6 +550,14 @@ class VoiceTranslator(private val context: Context) {
 
         if (text.isNotEmpty() && lastRaw[id] != text) {
             lastRaw[id] = text
+            if (id == generation) {
+                sessionHasText = true
+                lastTextChange = SystemClock.elapsedRealtime()
+                if (sessionUsesPump) {
+                    pumpHeardText = true
+                    silentSessions = 0
+                }
+            }
             val corrected = corrector.correct(text)
             if (index >= 0) {
                 if (corrected.isEmpty()) {
@@ -340,6 +590,25 @@ class VoiceTranslator(private val context: Context) {
         finalize(generation)
         level = 0f
         if (!isListening || pausedInBackground) return
+        val usedPump = sessionUsesPump
+        val early = SystemClock.elapsedRealtime() - sessionStart < 2000
+        endSession()
+        if (usedPump && !pumpHeardText) {
+            when (code) {
+                SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> checkSilentSession()
+                SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT, ERROR_SERVER_DISCONNECTED,
+                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS, SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> Unit
+                // Служба сразу отказалась от звука приложения — после трёх раз обычный микрофон.
+                else -> if (early) {
+                    earlyFailures += 1
+                    if (earlyFailures >= 3) {
+                        disableEnhance()
+                        return
+                    }
+                }
+            }
+            if (enhanceBroken) return
+        }
         when (code) {
             // Тишина или неразборчиво — это не ошибки, слушаем дальше.
             SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> scheduleRestart(50)
@@ -443,6 +712,11 @@ class VoiceTranslator(private val context: Context) {
         const val KEY_PAUSE = "splitPause"
         const val KEY_ON_DEVICE = "onDeviceOnly"
         const val KEY_MUTE = "muteBeep"
+        const val KEY_ENHANCE = "enhanceDistant"
+        const val KEY_BLUETOOTH = "bluetoothMic"
+        const val TICK_MS = 100L
+        const val MAX_PHRASE_MS = 30_000L
+        const val STOP_TIMEOUT_MS = 3_000L
         const val KEY_WORDS = "customWords"
     }
 }

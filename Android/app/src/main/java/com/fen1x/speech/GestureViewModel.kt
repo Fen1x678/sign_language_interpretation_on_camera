@@ -25,6 +25,7 @@ import com.fen1x.speech.core.HandSample
 import com.fen1x.speech.core.HandSmoother
 import com.fen1x.speech.core.MotionSpotter
 import com.fen1x.speech.core.MotionStream
+import com.fen1x.speech.core.PoseSteadiness
 import com.fen1x.speech.core.Pt
 import com.fen1x.speech.core.RecognitionResult
 import com.fen1x.speech.core.RestingHandFilter
@@ -197,6 +198,8 @@ class GestureViewModel(app: Application) : AndroidViewModel(app) {
     private val smoother = HandSmoother()
     /** Опущенная (лежащая) вторая рука не участвует в распознавании. */
     private val restingFilter = RestingHandFilter()
+    /** Поза распознаётся, только когда форма кисти устоялась (не в момент перехода между жестами). */
+    private val poseSteadiness = PoseSteadiness()
     private val motionBuffer = ArrayList<Timed<MotionSample>>()
     /** Центры рук за последние доли секунды — для скорости каждой руки. */
     private val centerHistory = ArrayList<Timed<List<Pt>>>()
@@ -397,6 +400,7 @@ class GestureViewModel(app: Application) : AndroidViewModel(app) {
     private fun resetRecognition() {
         recognizer.reset()
         spotter.reset()
+        poseSteadiness.reset()
         motionBuffer.clear()
         currentSign = Sign.None
         live.holdProgress = 0f
@@ -522,7 +526,8 @@ class GestureViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         val poseFeatures = poseVariants.map { FrameFeatures.from(it) }
-        val result = recognizer.process(handsForRecognition, now) { hands -> classifyStatic(hands, poseFeatures) }
+        val steady = poseSteadiness.update(poseFeatures.firstOrNull(), now)
+        val result = recognizer.process(handsForRecognition, now) { hands -> classifyStatic(hands, poseFeatures, steady) }
         apply(result)
         updateHint(now)
     }
@@ -672,10 +677,11 @@ class GestureViewModel(app: Application) : AndroidViewModel(app) {
      * Статичный жест.
      * «Перевод»: только жесты из словаря пользователя. «Управление»: встроенные жесты.
      */
-    private fun classifyStatic(hands: List<HandGeometry>, variants: List<FrameFeatures>): Sign {
+    private fun classifyStatic(hands: List<HandGeometry>, variants: List<FrameFeatures>, steady: Boolean): Sign {
         return when (mode) {
             AppMode.TRANSLATE -> {
-                if (variants.isEmpty()) return Sign.None
+                // Пальцы ещё меняют положение (переход между жестами) — позу не распознаём.
+                if (variants.isEmpty() || !steady) return Sign.None
                 val sticky = (currentSign as? Sign.Custom)?.id
                 val sign = library.classifyPose(variants, sticky) ?: return Sign.None
                 Sign.Custom(sign.id, sign.word)

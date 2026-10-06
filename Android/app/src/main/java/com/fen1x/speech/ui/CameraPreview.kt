@@ -67,14 +67,15 @@ private val TIPS = setOf(4, 8, 12, 16, 20)
  */
 @Composable
 fun HandOverlay(live: LiveState, isActive: Boolean, modifier: Modifier = Modifier) {
-    val color = if (isActive) Color(0xFF34C759) else Color(0xFFFFD60A)
-    val line = Color.White.copy(alpha = 0.85f)
+    // Мягкие цвета: мятный — жест узнан, янтарный — рука в кадре.
+    val color = if (isActive) Soft.Ok else Soft.Warm
+    val line = Color.White.copy(alpha = 0.7f)
     Canvas(modifier) {
         fun Pt.offset() = Offset(x.dp.toPx(), y.dp.toPx())
         val shoulders = live.shoulders
         // Плечи — так же, как точки рук: линия между плечами и две точки.
         if (shoulders.size == 2) {
-            drawLine(line, shoulders[0].offset(), shoulders[1].offset(), strokeWidth = 3.dp.toPx(), cap = StrokeCap.Round)
+            drawLine(line, shoulders[0].offset(), shoulders[1].offset(), strokeWidth = 3.5.dp.toPx(), cap = StrokeCap.Round)
             for (p in shoulders) drawCircle(color, radius = 7.dp.toPx(), center = p.offset())
         }
         val resting = live.resting
@@ -82,11 +83,11 @@ fun HandOverlay(live: LiveState, isActive: Boolean, modifier: Modifier = Modifie
             if (pts.size != 21) return@forEachIndexed
             // Опущенная рука не учитывается — рисуем её серым.
             val isResting = resting.getOrElse(h) { false }
-            val bones = if (isResting) Color.Gray.copy(alpha = 0.6f) else line
+            val bones = if (isResting) Color.Gray.copy(alpha = 0.5f) else line
             val joints = if (isResting) Color.Gray else color
             for ((a, b) in BONES) {
                 if (!pts[a].isValid || !pts[b].isValid) continue
-                drawLine(bones, pts[a].offset(), pts[b].offset(), strokeWidth = 3.dp.toPx(), cap = StrokeCap.Round)
+                drawLine(bones, pts[a].offset(), pts[b].offset(), strokeWidth = 3.5.dp.toPx(), cap = StrokeCap.Round)
             }
             pts.forEachIndexed { i, p ->
                 if (!p.isValid) return@forEachIndexed

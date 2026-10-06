@@ -38,11 +38,20 @@ class SignLibrary {
     private class Cache(
         /** Кадры поз (прорежены). */
         val poses: List<FrameFeatures>,
-        val poseThreshold: Float,
+        /** Порог по разбросу записей самого слова. */
+        val ownPoseThreshold: Float,
         /** Записи с движением. */
         val motions: List<MotionTemplate>,
-        val motionThreshold: Float,
-    )
+        val ownMotionThreshold: Float,
+        /** Самые типичные кадры каждой записи позы — для сравнения с другими словами. */
+        val poseMedoids: List<FrameFeatures>,
+        /** Укороченные записи с движением — для быстрого сравнения с другими словами. */
+        val motionProbes: List<MotionTemplate>,
+    ) {
+        /** Порог с учётом похожих слов словаря (см. [updateNeighbourLimits]). */
+        var poseThreshold: Float = ownPoseThreshold
+        var motionThreshold: Float = ownMotionThreshold
+    }
 
     private val cache = HashMap<String, Cache>()
 
@@ -78,14 +87,22 @@ class SignLibrary {
         cache.remove(id)
         signs = signs.filter { it.id != id }
         updateMotionWindow()
+        updateNeighbourLimits()
         onChange?.invoke()
     }
+
+    /** Порог позы слова с учётом похожих слов (для проверки). */
+    fun effectivePoseThreshold(id: String): Float? = cache[id]?.poseThreshold
+
+    /** Порог жеста с движением с учётом похожих слов (для проверки). */
+    fun effectiveMotionThreshold(id: String): Float? = cache[id]?.motionThreshold
 
     fun sign(id: String): CustomSign? = signs.firstOrNull { it.id == id }
 
     private fun replace(i: Int, sign: CustomSign) {
         signs = signs.toMutableList().also { it[i] = sign }
         rebuildCache(sign)
+        updateNeighbourLimits()
         onChange?.invoke()
     }
 
@@ -255,11 +272,45 @@ class SignLibrary {
         val motions = sign.motions.mapNotNull { MotionTemplate.from(it) }
         cache[sign.id] = Cache(
             poses = poseGroups.flatten(),
-            poseThreshold = poseThreshold(poseGroups),
+            ownPoseThreshold = poseThreshold(poseGroups),
             motions = motions,
-            motionThreshold = motionThreshold(motions),
+            ownMotionThreshold = motionThreshold(motions),
+            poseMedoids = poseGroups.mapNotNull { medoid(it) },
+            motionProbes = sign.motions.mapNotNull { MotionTemplate.from(SignMatching.evenlySpaced(it, PROBE_LENGTH)) },
         )
         updateMotionWindow()
+    }
+
+    /**
+     * Пороги с учётом соседей: если другое слово словаря похоже на это, порог этого слова
+     * становится строже (не больше [SignMatching.NEIGHBOUR_SHARE] расстояния до соседа),
+     * чтобы показанное «соседнее» слово не засчитывалось как это. Далёкие слова порог не меняют.
+     */
+    private fun updateNeighbourLimits() {
+        val entries = signs.mapNotNull { sign -> cache[sign.id]?.let { sign.id to it } }
+        for ((id, c) in entries) {
+            var poseMargin = Float.POSITIVE_INFINITY
+            var motionMargin = Float.POSITIVE_INFINITY
+            for ((otherId, other) in entries) {
+                if (otherId == id) continue
+                // Насколько записи другого слова похожи на это слово (так же, как при распознавании).
+                if (c.poses.isNotEmpty()) {
+                    for (query in other.poseMedoids) {
+                        poseMargin = min(poseMargin, poseCost(query, query.mirrored(), c.poses))
+                    }
+                }
+                if (c.motionProbes.isNotEmpty()) {
+                    for (query in other.motionProbes) {
+                        val stream = MotionStream(query.frames)
+                        for (template in c.motionProbes) {
+                            motionMargin = min(motionMargin, template.cost(stream).cost)
+                        }
+                    }
+                }
+            }
+            c.poseThreshold = neighbourLimit(c.ownPoseThreshold, poseMargin, SignMatching.BASE_POSE_THRESHOLD)
+            c.motionThreshold = neighbourLimit(c.ownMotionThreshold, motionMargin, SignMatching.BASE_MOTION_THRESHOLD)
+        }
     }
 
     private fun updateMotionWindow() {
@@ -281,6 +332,7 @@ class SignLibrary {
         signs = saved
         cache.clear()
         for (sign in signs) rebuildCache(sign)
+        updateNeighbourLimits()
         return true
     }
 
@@ -289,6 +341,13 @@ class SignLibrary {
         private const val MAX_POSE_FRAMES = 60
         /** Сколько кадров позы сохранять из одной записи. */
         private const val POSES_PER_RECORDING = 20
+        /** Длина укороченной записи с движением для сравнения слов между собой. */
+        private const val PROBE_LENGTH = 12
+
+        private fun neighbourLimit(own: Float, margin: Float, base: Float): Float {
+            if (!margin.isFinite()) return own
+            return min(own, max(base * SignMatching.MIN_THRESHOLD_SHARE, margin * SignMatching.NEIGHBOUR_SHARE))
+        }
 
         private val JSON = Json {
             ignoreUnknownKeys = true

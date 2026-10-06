@@ -4,7 +4,9 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
+import android.view.HapticFeedbackConstants
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -28,20 +30,15 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -58,9 +55,11 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -93,6 +92,20 @@ fun MainScreen(vm: GestureViewModel, onOpenSpeech: () -> Unit) {
     }
     var showHelp by remember { mutableStateOf(false) }
     var showLibrary by remember { mutableStateOf(false) }
+
+    // Лёгкий отклик вибрацией, когда слово переведено: можно не смотреть на экран.
+    val view = LocalView.current
+    var lastCount by remember { mutableStateOf(0) }
+    LaunchedEffect(vm.phraseWords.size) {
+        val count = vm.phraseWords.size
+        if (count > lastCount) {
+            view.performHapticFeedback(
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) HapticFeedbackConstants.CONFIRM
+                else HapticFeedbackConstants.KEYBOARD_TAP,
+            )
+        }
+        lastCount = count
+    }
 
     Box(
         Modifier
@@ -128,8 +141,8 @@ fun MainScreen(vm: GestureViewModel, onOpenSpeech: () -> Unit) {
                     textAlign = TextAlign.Center,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .panel(RoundedCornerShape(18.dp))
-                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                        .panel(RoundedCornerShape(22.dp))
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
                 )
             }
             Spacer(Modifier.weight(1f))
@@ -175,14 +188,11 @@ private fun TopBar(vm: GestureViewModel, onHelp: () -> Unit) {
         }
         Row(
             Modifier
-                .background(
-                    if (vm.isHandDetected) Color(0xCC34C759) else Color(0xB3FF3B30),
-                    RoundedCornerShape(50),
-                )
-                .padding(horizontal = 12.dp, vertical = 8.dp),
+                .weight(1f, fill = false)
+                .chip(if (vm.isHandDetected) Soft.Ok else Soft.Muted),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text((if (vm.isHandDetected) "✋ " else "🚫 ") + status, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Text((if (vm.isHandDetected) "✋ " else "💤 ") + status, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
             // Плечи найдены — учитывается, где руки относительно тела.
             if (vm.isBodyDetected) Text(" 🧍", fontSize = 13.sp)
         }
@@ -199,19 +209,20 @@ private fun TopBar(vm: GestureViewModel, onHelp: () -> Unit) {
 private fun LightButton(vm: GestureViewModel) {
     var expanded by remember { mutableStateOf(false) }
     Box {
-        CircleButton("🔦", "Подсветка", background = if (vm.isLightOn) Color(0xFFFFD60A) else PanelColor) {
+        CircleButton("🔦", "Подсветка", background = if (vm.isLightOn) Soft.Warm else PanelColor) {
             expanded = true
         }
         if (vm.lightMode == LightMode.AUTO) {
             Text(
                 "A",
-                fontSize = 9.sp,
+                fontSize = 10.sp,
                 fontWeight = FontWeight.Bold,
+                color = Soft.OnColor,
                 textAlign = TextAlign.Center,
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
-                    .size(15.dp)
-                    .background(Color(0xFF0A84FF), CircleShape),
+                    .size(17.dp)
+                    .background(Soft.Accent, CircleShape),
             )
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
@@ -255,10 +266,8 @@ private fun FpsLabel(live: LiveState, isFront: Boolean) {
         "${live.fps} FPS · ${if (isFront) "фронт." else "задняя"}",
         fontSize = 12.sp,
         fontFamily = FontFamily.Monospace,
-        color = Color.White,
-        modifier = Modifier
-            .panel(RoundedCornerShape(50))
-            .padding(horizontal = 10.dp, vertical = 7.dp),
+        color = Color.White.copy(alpha = 0.8f),
+        modifier = Modifier.chip(),
     )
 }
 
@@ -269,8 +278,8 @@ private fun GestureBadge(vm: GestureViewModel) {
     Row(
         Modifier
             .fillMaxWidth()
-            .panel(RoundedCornerShape(20.dp))
-            .padding(12.dp),
+            .panel(RoundedCornerShape(24.dp))
+            .padding(14.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(14.dp),
     ) {
@@ -310,7 +319,7 @@ private fun HoldRing(live: LiveState, emoji: String) {
             val arcSize = Size(size.width - stroke, size.height - stroke)
             drawArc(Color.White.copy(alpha = 0.2f), 0f, 360f, false, Offset(inset, inset), arcSize, style = Stroke(stroke))
             drawArc(
-                Color(0xFF34C759), -90f, 360f * live.holdProgress, false, Offset(inset, inset), arcSize,
+                Soft.Ok, -90f, 360f * live.holdProgress, false, Offset(inset, inset), arcSize,
                 style = Stroke(stroke, cap = StrokeCap.Round),
             )
         }
@@ -325,19 +334,14 @@ private fun TranslationPanel(vm: GestureViewModel, onOpenSpeech: () -> Unit, onO
     Column(
         Modifier
             .fillMaxWidth()
-            .panel()
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+            .panel(RoundedCornerShape(30.dp))
+            .padding(18.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             // Голосовой перевод: речь людей вокруг → текст на отдельной странице.
-            TextButton(onClick = onOpenSpeech) { Text("🎤 Речь → текст", fontWeight = FontWeight.SemiBold) }
-            Spacer(Modifier.weight(1f))
-            TextButton(onClick = onOpenLibrary) { Text("➕ Словарь", fontWeight = FontWeight.SemiBold) }
-            IconButton(onClick = { vm.speakPhrase() }) {
-                Icon(Icons.Filled.PlayArrow, contentDescription = "Произнести фразу")
-            }
-            TextButton(onClick = { vm.toggleSpeech() }) { Text(if (vm.isSpeechEnabled) "🔊" else "🔇", fontSize = 18.sp) }
+            SoftPill("🎤 Речь → текст", prominent = true, onClick = onOpenSpeech)
+            SoftPill("＋ Словарь", onClick = onOpenLibrary)
         }
 
         val empty = vm.phraseWords.isEmpty()
@@ -348,19 +352,24 @@ private fun TranslationPanel(vm: GestureViewModel, onOpenSpeech: () -> Unit, onO
                 else -> "Показывайте жесты — перевод появится здесь"
             },
             fontSize = if (empty) 16.sp else 32.sp,
+            lineHeight = if (empty) 22.sp else 38.sp,
             fontWeight = if (empty) FontWeight.Normal else FontWeight.Bold,
             color = if (empty) Secondary else Color.White,
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = 56.dp),
+                .heightIn(min = 60.dp)
+                .background(Color.White.copy(alpha = 0.06f), RoundedCornerShape(20.dp))
+                .padding(horizontal = 14.dp, vertical = 10.dp),
         )
 
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = { vm.deleteLastWord() }) { Text("⌫ Стереть") }
-            OutlinedButton(onClick = { vm.finishPhrase() }) { Text("↵ Фраза готова") }
+            CircleButton("⌫", "Стереть слово", size = 42.dp) { vm.deleteLastWord() }
+            SoftPill("✓ Готово", tint = Soft.Ok, onClick = { vm.finishPhrase() })
             Spacer(Modifier.weight(1f))
-            IconButton(onClick = { vm.clearTranslation() }) {
-                Icon(Icons.Filled.Delete, contentDescription = "Очистить", tint = Color(0xFFFF6B5E))
+            CircleButton("▶", "Произнести фразу", size = 42.dp) { vm.speakPhrase() }
+            CircleButton(if (vm.isSpeechEnabled) "🔊" else "🔇", "Голос", size = 42.dp) { vm.toggleSpeech() }
+            RoundButton(42.dp, PanelColor, "Очистить", onClick = { vm.clearTranslation() }) {
+                Icon(Icons.Filled.Delete, contentDescription = null, tint = Soft.Alert)
             }
         }
 
@@ -368,7 +377,7 @@ private fun TranslationPanel(vm: GestureViewModel, onOpenSpeech: () -> Unit, onO
             Text(phrase, fontSize = 14.sp, color = Secondary)
         }
 
-        Text("Опустите руки на 2 секунды — фраза закончится сама", fontSize = 11.sp, color = Secondary)
+        Text("✋ Опустите руки на 2 секунды — фраза закончится сама", fontSize = 12.sp, color = Secondary)
     }
 }
 
@@ -380,15 +389,15 @@ private fun DemoPanel(vm: GestureViewModel) {
     Column(
         Modifier
             .fillMaxWidth()
-            .panel()
-            .padding(16.dp),
+            .panel(RoundedCornerShape(30.dp))
+            .padding(18.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Box(
                 Modifier
                     .size(44.dp)
-                    .background(Color(0x404DA3FF), RoundedCornerShape(12.dp)),
+                    .background(Soft.Accent.copy(alpha = 0.25f), RoundedCornerShape(14.dp)),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(screen.icon, fontSize = 22.sp)
@@ -398,7 +407,7 @@ private fun DemoPanel(vm: GestureViewModel) {
                 Text("Экран ${vm.screenIndex + 1} из ${vm.screens.size}", fontSize = 12.sp, color = Secondary)
             }
             if (vm.selectedIndex == vm.screenIndex) {
-                Text("✅ Выбран", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF34C759))
+                Text("✅ Выбран", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Soft.Ok)
             }
         }
 
@@ -417,9 +426,14 @@ private fun DemoPanel(vm: GestureViewModel) {
             Spacer(Modifier.weight(1f))
             Text("🔊 ${vm.volume}%", fontSize = 14.sp, fontFamily = FontFamily.Monospace)
         }
-        LinearProgressIndicator(progress = { vm.volume / 100f }, modifier = Modifier.fillMaxWidth())
+        LinearProgressIndicator(
+            progress = { vm.volume / 100f },
+            color = Soft.Accent,
+            trackColor = Color.White.copy(alpha = 0.12f),
+            modifier = Modifier.fillMaxWidth(),
+        )
 
-        vm.confirmation?.let { Text("✅ $it", fontSize = 14.sp, color = Color(0xFF34C759)) }
+        vm.confirmation?.let { Text("✅ $it", fontSize = 14.sp, color = Soft.Ok) }
 
         for (line in vm.log) {
             Text(line, fontSize = 11.sp, fontFamily = FontFamily.Monospace, color = Secondary)
@@ -433,9 +447,9 @@ private fun DemoPanel(vm: GestureViewModel) {
 private fun RecordingOverlay(vm: GestureViewModel, modifier: Modifier) {
     Column(
         modifier
-            .widthIn(max = 300.dp)
-            .panel()
-            .padding(24.dp),
+            .widthIn(max = 310.dp)
+            .panel(RoundedCornerShape(30.dp))
+            .padding(26.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
@@ -453,7 +467,12 @@ private fun RecordingOverlay(vm: GestureViewModel, modifier: Modifier) {
                     fontSize = 17.sp,
                     fontWeight = FontWeight.SemiBold,
                 )
-                LinearProgressIndicator(progress = { state.progress }, color = Color(0xFFFF3B30), modifier = Modifier.width(200.dp))
+                LinearProgressIndicator(
+                    progress = { state.progress },
+                    color = Soft.Alert,
+                    trackColor = Color.White.copy(alpha = 0.12f),
+                    modifier = Modifier.width(200.dp),
+                )
                 Text(
                     if (vm.recordingDynamic) "Показывайте так же, как обычно, с обычной скоростью"
                     else "Слегка поворачивайте кисть — так жест будет узнаваться надёжнее",
@@ -473,13 +492,13 @@ private fun ErrorOverlay(message: String, modifier: Modifier, onOpenSettings: ()
     Column(
         modifier
             .padding(32.dp)
-            .panel(RoundedCornerShape(20.dp))
-            .padding(24.dp),
+            .panel()
+            .padding(26.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text("📷", fontSize = 34.sp)
         Text(message, textAlign = TextAlign.Center)
-        Button(onClick = onOpenSettings) { Text("Открыть настройки") }
+        SoftPill("Открыть настройки", prominent = true, onClick = onOpenSettings)
     }
 }

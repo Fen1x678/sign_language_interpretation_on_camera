@@ -7,7 +7,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -25,7 +25,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -117,7 +116,7 @@ fun SpeechScreen(dictionaryWords: List<String>, onClose: () -> Unit) {
     Column(
         Modifier
             .fillMaxSize()
-            .background(Color.Black)
+            .background(Soft.Background)
             .safeDrawingPadding(),
     ) {
         Header(translator, onClose = close, onWords = { showWords = true })
@@ -162,6 +161,16 @@ private fun Header(translator: VoiceTranslator, onClose: () -> Unit, onWords: ()
                     )
                 }
                 HorizontalDivider()
+                if (translator.supportsEnhance) {
+                    DropdownMenuItem(
+                        text = { Text((if (translator.enhanceDistant) "✓ " else "    ") + "Дальняя и тихая речь (усиление)") },
+                        onClick = { translator.changeEnhanceDistant(!translator.enhanceDistant) },
+                    )
+                }
+                DropdownMenuItem(
+                    text = { Text((if (translator.bluetoothMic) "✓ " else "    ") + "Микрофон Bluetooth") },
+                    onClick = { translator.changeBluetoothMic(!translator.bluetoothMic) },
+                )
                 if (translator.supportsOnDevice) {
                     DropdownMenuItem(
                         text = { Text((if (translator.onDeviceOnly) "✓ " else "    ") + "Только на телефоне (без интернета)") },
@@ -200,16 +209,30 @@ private fun Transcript(translator: VoiceTranslator, modifier: Modifier) {
             state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             if (phrases.isEmpty()) {
                 item {
-                    Text(
-                        if (translator.isListening) "Говорите — текст появится здесь" else "Нажмите на микрофон, чтобы начать",
-                        fontSize = 20.sp,
-                        color = Secondary,
-                        modifier = Modifier.padding(top = 40.dp),
-                    )
+                    Column(
+                        Modifier
+                            .padding(top = 24.dp)
+                            .fillMaxWidth()
+                            .background(Soft.Card, RoundedCornerShape(26.dp))
+                            .padding(20.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Text(if (translator.isListening) "〰️" else "🎤", fontSize = 30.sp)
+                        Text(
+                            if (translator.isListening) "Говорите — текст появится здесь" else "Нажмите на микрофон, чтобы начать",
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Text(
+                            "Можно положить телефон на стол между собеседниками. Если человек далеко, держите телефон низом (микрофоном) к нему.",
+                            fontSize = 14.sp,
+                            color = Secondary,
+                        )
+                    }
                 }
             }
             items(phrases, key = { it.id }) { phrase ->
@@ -218,36 +241,39 @@ private fun Transcript(translator: VoiceTranslator, modifier: Modifier) {
             item(key = "bottom") { Spacer(Modifier.heightIn(min = 1.dp)) }
         }
         if (!follow && phrases.isNotEmpty()) {
-            Text(
+            SoftPill(
                 "↓ К новым",
-                fontWeight = FontWeight.SemiBold,
+                prominent = true,
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
-                    .padding(bottom = 12.dp)
-                    .background(PanelColor, RoundedCornerShape(50))
-                    .clickable {
-                        follow = true
-                        scope.launch { listState.animateScrollToItem(phrases.size) }
-                    }
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
-            )
+                    .padding(bottom = 12.dp),
+            ) {
+                follow = true
+                scope.launch { listState.animateScrollToItem(phrases.size) }
+            }
         }
     }
 }
 
 private val TIME_FORMAT = SimpleDateFormat("HH:mm", Locale.getDefault())
 
-/** Одна фраза: время и текст. Жёлтая — фраза ещё звучит и может измениться. */
+/** Одна фраза: время и текст. Янтарная — фраза ещё звучит и может измениться. */
 @Composable
 private fun PhraseRow(phrase: SpokenPhrase, fontSize: Float, highlighted: Boolean) {
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(if (highlighted) Soft.Warm.copy(alpha = 0.10f) else Soft.Card, RoundedCornerShape(22.dp))
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
         Text(TIME_FORMAT.format(Date(phrase.time)), fontSize = 11.sp, color = Secondary, fontFamily = FontFamily.Monospace)
         Text(
             phrase.text,
             fontSize = fontSize.sp,
             lineHeight = (fontSize * 1.2f).sp,
             fontWeight = FontWeight.SemiBold,
-            color = if (highlighted) Color(0xFFFFD60A) else Color.White,
+            color = if (highlighted) Soft.Warm else Color.White,
             modifier = Modifier.fillMaxWidth(),
         )
     }
@@ -255,54 +281,52 @@ private fun PhraseRow(phrase: SpokenPhrase, fontSize: Float, highlighted: Boolea
 
 @Composable
 private fun Controls(translator: VoiceTranslator, onToggle: () -> Unit) {
+    val sheet = RoundedCornerShape(topStart = 30.dp, topEnd = 30.dp)
     Column(
         Modifier
             .fillMaxWidth()
-            .background(Color(0xFF1C1C1E))
-            .padding(top = 10.dp, bottom = 16.dp),
+            .background(Color(0xFF1B1E27), sheet)
+            .border(1.dp, Color.White.copy(alpha = 0.06f), sheet)
+            .padding(top = 14.dp, bottom = 16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         translator.error?.let {
-            Text(it, fontSize = 13.sp, color = Color(0xFFFF9F0A), textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 16.dp))
+            Text(it, fontSize = 13.sp, color = Soft.Alert, textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 16.dp))
         }
         ListeningStatus(translator)
-        Row(horizontalArrangement = Arrangement.spacedBy(28.dp), verticalAlignment = Alignment.CenterVertically) {
-            RoundButton(52, PanelColor, "Очистить", enabled = translator.phrases.isNotEmpty(), onClick = { translator.clear() }) {
+        Row(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            RoundButton(50.dp, PanelColor, "Очистить", enabled = translator.phrases.isNotEmpty(), onClick = { translator.clear() }) {
                 Icon(Icons.Filled.Delete, contentDescription = null, tint = Color.White)
             }
+            // Дальняя речь: усиление тихого и далёкого голоса (Android 13+).
+            if (translator.supportsEnhance) {
+                CircleButton(
+                    "👂",
+                    if (translator.enhanceDistant) "Дальняя речь включена" else "Дальняя речь выключена",
+                    background = if (translator.enhanceDistant) Soft.Accent else PanelColor,
+                    size = 50.dp,
+                ) { translator.changeEnhanceDistant(!translator.enhanceDistant) }
+            }
             RoundButton(
-                78,
-                if (translator.isListening) Color(0xFFFF3B30) else Color(0xFF0A84FF),
+                76.dp,
+                if (translator.isListening) Soft.Alert else Soft.Accent,
                 if (translator.isListening) "Остановить" else "Слушать",
                 onClick = onToggle,
             ) {
-                Text(if (translator.isListening) "■" else "🎤", fontSize = 30.sp, color = Color.White)
+                Text(if (translator.isListening) "■" else "🎤", fontSize = 30.sp, color = Soft.OnColor)
             }
-            RoundButton(52, PanelColor, "Размер текста", onClick = { translator.changeFontSize() }) {
-                Text("Aa", fontSize = 18.sp, color = Color(0xFF4DA3FF), fontWeight = FontWeight.SemiBold)
+            RoundButton(50.dp, PanelColor, "Размер текста", onClick = { translator.changeFontSize() }) {
+                Text("Aa", fontSize = 18.sp, color = Soft.Accent, fontWeight = FontWeight.SemiBold)
             }
+            // Микрофон Bluetooth: наушники можно дать говорящему.
+            CircleButton(
+                "🎧",
+                if (translator.bluetoothMic) "Микрофон Bluetooth включён" else "Микрофон Bluetooth выключен",
+                background = if (translator.bluetoothMic) Soft.Accent else PanelColor,
+                size = 50.dp,
+            ) { translator.changeBluetoothMic(!translator.bluetoothMic) }
         }
-    }
-}
-
-@Composable
-private fun RoundButton(
-    size: Int,
-    color: Color,
-    description: String,
-    enabled: Boolean = true,
-    onClick: () -> Unit,
-    content: @Composable () -> Unit,
-) {
-    Box(
-        Modifier
-            .size(size.dp)
-            .background(if (enabled) color else color.copy(alpha = 0.4f), CircleShape)
-            .clickable(enabled = enabled, onClickLabel = description, onClick = onClick),
-        contentAlignment = Alignment.Center,
-    ) {
-        content()
     }
 }
 
@@ -314,15 +338,15 @@ private fun ListeningStatus(translator: VoiceTranslator) {
         if (translator.isListening) {
             Box(
                 Modifier
-                    .width(160.dp)
-                    .heightIn(min = 6.dp, max = 6.dp)
-                    .background(Color(0x26FFFFFF), RoundedCornerShape(50)),
+                    .width(180.dp)
+                    .heightIn(min = 8.dp, max = 8.dp)
+                    .background(Color(0x1FFFFFFF), RoundedCornerShape(50)),
             ) {
                 Box(
                     Modifier
                         .fillMaxHeight()
                         .fillMaxWidth(level.coerceIn(0.04f, 1f))
-                        .background(if (level > 0.35f) Color(0xFF34C759) else Color.Gray, RoundedCornerShape(50)),
+                        .background(if (level > 0.35f) Soft.Ok else Soft.Muted, RoundedCornerShape(50)),
                 )
             }
         }
@@ -335,7 +359,7 @@ private fun ListeningStatus(translator: VoiceTranslator) {
         Text(
             status,
             fontSize = 12.sp,
-            color = if (notice != null && translator.isListening) Color(0xFFFF9F0A) else Secondary,
+            color = if (notice != null && translator.isListening) Soft.Warm else Secondary,
             textAlign = TextAlign.Center,
             modifier = Modifier.padding(horizontal = 16.dp),
         )
@@ -382,7 +406,7 @@ private fun WordsDialog(translator: VoiceTranslator, onDismiss: () -> Unit) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(word, Modifier.weight(1f))
                             IconButton(onClick = { translator.removeWord(word) }) {
-                                Icon(Icons.Filled.Delete, contentDescription = "Удалить «$word»", tint = Color(0xFFFF6B5E))
+                                Icon(Icons.Filled.Delete, contentDescription = "Удалить «$word»", tint = Soft.Alert)
                             }
                         }
                     }

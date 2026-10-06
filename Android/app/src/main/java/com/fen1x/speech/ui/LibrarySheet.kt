@@ -138,7 +138,7 @@ fun LibrarySheet(vm: GestureViewModel, onDismiss: () -> Unit, onRecord: (String,
                     }
                     Text("записей: ${sign.recordings}", fontSize = 12.sp, color = Secondary)
                     IconButton(onClick = { toDelete = sign }) {
-                        Icon(Icons.Filled.Delete, contentDescription = "Удалить «${sign.word}»", tint = Color(0xFFFF6B5E))
+                        Icon(Icons.Filled.Delete, contentDescription = "Удалить «${sign.word}»", tint = Soft.Alert)
                     }
                 }
             }
@@ -192,7 +192,7 @@ fun LibrarySheet(vm: GestureViewModel, onDismiss: () -> Unit, onRecord: (String,
                 TextButton(onClick = {
                     vm.deleteSign(sign.id)
                     toDelete = null
-                }) { Text("Удалить", color = Color(0xFFFF6B5E)) }
+                }) { Text("Удалить", color = Soft.Alert) }
             },
             dismissButton = { TextButton(onClick = { toDelete = null }) { Text("Отмена") } },
         )

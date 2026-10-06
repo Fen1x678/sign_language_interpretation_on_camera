@@ -7,6 +7,9 @@
     <!-- Камера — для распознавания жестов, микрофон — для страницы «Речь → текст». -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Микрофон Bluetooth-наушников для «Речь → текст» (обычные разрешения, без запроса). -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
 
     <!-- С Android 11 без этого приложение не видит службу распознавания речи и синтеза речи. -->
     <queries>
