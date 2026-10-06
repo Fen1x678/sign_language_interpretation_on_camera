@@ -18,7 +18,7 @@ struct SpeechView: View {
                 transcript
                 controls
             }
-            .background(Color.black.ignoresSafeArea())
+            .background(Soft.background.ignoresSafeArea())
             .navigationTitle("Речь → текст")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -33,6 +33,7 @@ struct SpeechView: View {
                 }
             }
         }
+        .tint(Soft.accent)
         .preferredColorScheme(.dark)
         .task {
             translator.setDictionaryWords(dictionaryWords)
@@ -49,14 +50,24 @@ struct SpeechView: View {
     private var transcript: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 14) {
+                LazyVStack(alignment: .leading, spacing: 12) {
                     if translator.phrases.isEmpty {
-                        Text(translator.isListening
-                             ? "Говорите — текст появится здесь"
-                             : "Нажмите на микрофон, чтобы начать")
-                            .font(.title3)
-                            .foregroundStyle(.secondary)
-                            .padding(.top, 40)
+                        VStack(alignment: .leading, spacing: 12) {
+                            Image(systemName: translator.isListening ? "waveform" : "mic")
+                                .font(.system(size: 34, weight: .medium))
+                                .foregroundStyle(Soft.accent)
+                            Text(translator.isListening
+                                 ? "Говорите — текст появится здесь"
+                                 : "Нажмите на микрофон, чтобы начать")
+                                .font(.title3.weight(.medium))
+                            Text("Можно положить телефон на стол между собеседниками. Если человек далеко, держите телефон низом (микрофоном) к нему.")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(20)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Soft.card, in: RoundedRectangle(cornerRadius: Soft.cornerRadius, style: .continuous))
+                        .padding(.top, 24)
                     }
                     ForEach(translator.phrases) { phrase in
                         // Строка перерисовывается, только когда меняется её текст.
@@ -88,12 +99,11 @@ struct SpeechView: View {
                         }
                     } label: {
                         Label("К новым", systemImage: "arrow.down")
-                            .font(.subheadline.weight(.semibold))
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 10)
-                            .background(.ultraThinMaterial, in: Capsule())
                     }
+                    .buttonStyle(SoftPillButtonStyle(prominent: true))
+                    .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
                     .padding(.bottom, 12)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
         }
@@ -113,29 +123,37 @@ struct SpeechView: View {
     // MARK: Управление
 
     private var controls: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 12) {
             if let error = translator.error {
                 Text(error)
                     .font(.footnote)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(Soft.alert)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 16)
             }
             ListeningStatus(meter: translator.meter,
                             isListening: translator.isListening,
                             notice: translator.notice)
-            HStack(spacing: 28) {
+            HStack(spacing: 16) {
                 Button {
                     translator.clear()
                     follow = true
                 } label: {
                     Image(systemName: "trash")
-                        .font(.title2)
-                        .frame(width: 52, height: 52)
-                        .background(.ultraThinMaterial, in: Circle())
                 }
+                .buttonStyle(SoftIconButtonStyle(size: 50))
                 .disabled(translator.phrases.isEmpty)
+                .opacity(translator.phrases.isEmpty ? 0.4 : 1)
                 .accessibilityLabel("Очистить")
+
+                // Дальняя речь: усиление тихого и далёкого голоса.
+                Button {
+                    translator.enhanceDistant.toggle()
+                } label: {
+                    Image(systemName: "ear")
+                }
+                .buttonStyle(SoftIconButtonStyle(size: 50, tint: translator.enhanceDistant ? Soft.accent : nil))
+                .accessibilityLabel(translator.enhanceDistant ? "Дальняя речь включена" : "Дальняя речь выключена")
 
                 Button {
                     if translator.isListening {
@@ -145,28 +163,41 @@ struct SpeechView: View {
                     }
                 } label: {
                     Image(systemName: translator.isListening ? "stop.fill" : "mic.fill")
-                        .font(.system(size: 30, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 78, height: 78)
-                        .background(translator.isListening ? Color.red : Color.accentColor, in: Circle())
+                        .contentTransition(.symbolEffect(.replace))
                 }
+                .buttonStyle(SoftIconButtonStyle(size: 76, tint: translator.isListening ? Soft.alert : Soft.accent))
+                .shadow(color: (translator.isListening ? Soft.alert : Soft.accent).opacity(0.35), radius: 14, y: 4)
                 .accessibilityLabel(translator.isListening ? "Остановить" : "Слушать")
 
                 Button {
                     translator.fontSize = translator.fontSize >= 48 ? 22 : translator.fontSize + 6
                 } label: {
                     Image(systemName: "textformat.size")
-                        .font(.title2)
-                        .frame(width: 52, height: 52)
-                        .background(.ultraThinMaterial, in: Circle())
                 }
+                .buttonStyle(SoftIconButtonStyle(size: 50))
                 .accessibilityLabel("Размер текста")
+
+                // Микрофон Bluetooth: наушники можно дать говорящему.
+                Button {
+                    translator.bluetoothMic.toggle()
+                } label: {
+                    Image(systemName: "headphones")
+                }
+                .buttonStyle(SoftIconButtonStyle(size: 50, tint: translator.bluetoothMic ? Soft.accent : nil))
+                .accessibilityLabel(translator.bluetoothMic ? "Микрофон Bluetooth включён" : "Микрофон Bluetooth выключен")
             }
         }
-        .padding(.top, 10)
+        .padding(.top, 14)
         .padding(.bottom, 16)
         .frame(maxWidth: .infinity)
-        .background(.ultraThinMaterial)
+        .background {
+            UnevenRoundedRectangle(topLeadingRadius: 30, topTrailingRadius: 30, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .ignoresSafeArea(edges: .bottom)
+        }
+        .animation(Soft.animation, value: translator.isListening)
+        .animation(Soft.animation, value: translator.enhanceDistant)
+        .animation(Soft.animation, value: translator.bluetoothMic)
     }
 
     private var settingsMenu: some View {
@@ -184,6 +215,12 @@ struct SpeechView: View {
                 Label("Новая строка после паузы", systemImage: "timer")
             }
             .pickerStyle(.menu)
+            Toggle(isOn: $translator.enhanceDistant) {
+                Label("Дальняя и тихая речь (усиление)", systemImage: "ear")
+            }
+            Toggle(isOn: $translator.bluetoothMic) {
+                Label("Микрофон Bluetooth", systemImage: "headphones")
+            }
             if translator.supportsOnDevice {
                 Toggle(isOn: $translator.onDeviceOnly) {
                     Label("Только на телефоне (без интернета)", systemImage: "iphone")
@@ -202,16 +239,20 @@ private struct PhraseRow: View, Equatable {
     let highlighted: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
             Text(phrase.time.formatted(date: .omitted, time: .shortened))
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
             Text(phrase.text)
-                .font(.system(size: fontSize, weight: .semibold))
-                .foregroundStyle(highlighted ? Color.yellow : Color.primary)
+                .font(.system(size: fontSize, weight: .semibold, design: .rounded))
+                .foregroundStyle(highlighted ? Soft.warm : Color.primary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(highlighted ? Soft.warm.opacity(0.10) : Soft.card,
+                    in: RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
 }
 
@@ -227,19 +268,19 @@ private struct ListeningStatus: View {
             if isListening {
                 GeometryReader { geometry in
                     ZStack(alignment: .leading) {
-                        Capsule().fill(Color.white.opacity(0.15))
+                        Capsule().fill(Color.white.opacity(0.12))
                         Capsule()
-                            .fill(meter.hearsVoice ? Color.green : Color.gray)
-                            .frame(width: max(6, geometry.size.width * CGFloat(meter.level)))
+                            .fill(meter.hearsVoice ? Soft.ok : Soft.muted)
+                            .frame(width: max(8, geometry.size.width * CGFloat(meter.level)))
                     }
                 }
-                .frame(width: 160, height: 6)
+                .frame(width: 180, height: 8)
                 .animation(.linear(duration: 0.1), value: meter.level)
                 .accessibilityHidden(true)
             }
             Text(status)
                 .font(.caption)
-                .foregroundStyle(notice == nil ? Color.secondary : Color.orange)
+                .foregroundStyle(notice == nil ? Color.secondary : Soft.warm)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 16)
         }

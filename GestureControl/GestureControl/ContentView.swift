@@ -39,9 +39,9 @@ struct ContentView: View {
                     Text(notice)
                         .font(.subheadline.weight(.semibold))
                         .multilineTextAlignment(.center)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 12)
+                        .softCard(cornerRadius: 20)
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
                 Spacer()
@@ -63,8 +63,11 @@ struct ContentView: View {
                 errorOverlay(error)
             }
         }
-        .animation(.snappy, value: vm.notice)
+        .animation(Soft.animation, value: vm.notice)
+        .tint(Soft.accent)
         .preferredColorScheme(.dark)
+        // Лёгкий отклик вибрацией, когда слово переведено: можно не смотреть на экран.
+        .sensoryFeedback(.success, trigger: vm.phraseWords.count) { old, new in new > old }
         .task { await vm.start() }
         .onAppear { openSpeechIfOnCall() }
         .onChange(of: scenePhase) { _, phase in
@@ -112,7 +115,7 @@ struct ContentView: View {
                 Text(vm.recordingDynamic ? "Покажите жест целиком, с движением" : "Держите жест")
                     .font(.headline)
                 ProgressView(value: progress)
-                    .tint(.red)
+                    .tint(Soft.alert)
                     .frame(width: 200)
                 Text(vm.recordingDynamic
                      ? "Показывайте так же, как обычно, с обычной скоростью"
@@ -126,10 +129,10 @@ struct ContentView: View {
             Text("«\(vm.recordingWord)»")
                 .font(.title2.bold())
         }
-        .padding(24)
-        .frame(maxWidth: 300)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-        .animation(.snappy, value: vm.recording)
+        .padding(26)
+        .frame(maxWidth: 310)
+        .softCard(cornerRadius: 30)
+        .animation(Soft.animation, value: vm.recording)
     }
 
     // MARK: Верхняя панель: состояние системы и кнопки
@@ -147,10 +150,10 @@ struct ContentView: View {
                 }
             }
             .font(.footnote.weight(.semibold))
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(vm.isHandDetected ? Color.green.opacity(0.8) : Color.red.opacity(0.7),
-                        in: Capsule())
+            .lineLimit(1)
+            .minimumScaleFactor(0.75)
+            .softChip(vm.isHandDetected ? Soft.ok : Soft.muted)
+            .animation(Soft.animation, value: vm.isHandDetected)
 
             Spacer()
 
@@ -175,16 +178,18 @@ struct ContentView: View {
         } label: {
             ZStack(alignment: .bottomTrailing) {
                 Image(systemName: vm.isLightOn ? "flashlight.on.fill" : "flashlight.off.fill")
-                    .foregroundStyle(vm.isLightOn ? Color.black : Color.white)
-                    .frame(width: 38, height: 38)
-                    .background(vm.isLightOn ? AnyShapeStyle(Color.yellow) : AnyShapeStyle(Material.ultraThinMaterial),
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(vm.isLightOn ? Color.black.opacity(0.8) : Color.white)
+                    .frame(width: 42, height: 42)
+                    .background(vm.isLightOn ? AnyShapeStyle(Soft.warm) : AnyShapeStyle(Material.ultraThinMaterial),
                                 in: Circle())
+                    .overlay(Circle().strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
                 if vm.lightMode == .auto {
                     Text("A")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 15, height: 15)
-                        .background(Color.blue, in: Circle())
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.black.opacity(0.8))
+                        .frame(width: 17, height: 17)
+                        .background(Soft.accent, in: Circle())
                 }
             }
         }
@@ -198,6 +203,8 @@ struct ContentView: View {
                 }
             }
             .pickerStyle(.segmented)
+            .padding(4)
+            .background(.ultraThinMaterial, in: Capsule())
 
             FPSLabel(live: vm.live, isFront: vm.cameraPosition == .front)
         }
@@ -206,9 +213,8 @@ struct ContentView: View {
     private func circleButton(_ symbol: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .frame(width: 38, height: 38)
-                .background(.ultraThinMaterial, in: Circle())
         }
+        .buttonStyle(SoftIconButtonStyle(size: 42))
     }
 
     // MARK: Распознанный жест
@@ -227,8 +233,9 @@ struct ContentView: View {
             }
             Spacer(minLength: 0)
         }
-        .padding(12)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .padding(14)
+        .softCard(cornerRadius: 24)
+        .animation(Soft.animation, value: vm.currentSign)
     }
 
     private var badgeSubtitle: String {
@@ -251,66 +258,78 @@ struct ContentView: View {
     // MARK: Режим «Перевод»
 
     private var translationPanel: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
                 // Голосовой перевод: речь людей вокруг → текст на отдельной странице.
                 Button {
                     showSpeech = true
                 } label: {
                     Label("Речь → текст", systemImage: "mic.fill")
-                        .font(.subheadline.weight(.semibold))
                 }
-                Spacer()
+                .buttonStyle(SoftPillButtonStyle(prominent: true))
                 Button {
                     showLibrary = true
                 } label: {
-                    Label("Словарь", systemImage: "plus.circle.fill")
-                        .font(.subheadline.weight(.semibold))
+                    Label("Словарь", systemImage: "plus")
                 }
-                Button {
-                    vm.speakPhrase()
-                } label: {
-                    Image(systemName: "play.circle.fill").font(.title2)
-                }
-                Button {
-                    vm.isSpeechEnabled.toggle()
-                } label: {
-                    Image(systemName: vm.isSpeechEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
-                        .font(.title3)
-                        .frame(width: 32)
-                }
+                .buttonStyle(SoftPillButtonStyle())
+                Spacer(minLength: 0)
             }
+            .lineLimit(1)
 
             Text(vm.phraseWords.isEmpty
                  ? (vm.library.signs.isEmpty
                     ? "Словарь пуст. Нажмите «Словарь» и покажите жесты, которые нужно переводить."
                     : "Показывайте жесты — перевод появится здесь")
                  : vm.phraseText)
-                .font(vm.phraseWords.isEmpty ? Font.body : Font.largeTitle.bold())
+                .font(vm.phraseWords.isEmpty ? Font.body : Font.system(.largeTitle, design: .rounded).bold())
                 .foregroundStyle(vm.phraseWords.isEmpty ? Color.secondary : Color.primary)
                 .minimumScaleFactor(0.5)
-                .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
+                .frame(maxWidth: .infinity, minHeight: 60, alignment: .leading)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .contentTransition(.opacity)
 
             HStack(spacing: 8) {
                 Button {
                     vm.deleteLastWord()
                 } label: {
-                    Label("Стереть", systemImage: "delete.left")
+                    Image(systemName: "delete.left")
                 }
+                .buttonStyle(SoftIconButtonStyle(size: 42))
+                .accessibilityLabel("Стереть слово")
                 Button {
                     vm.finishPhrase()
                 } label: {
-                    Label("Фраза готова", systemImage: "return")
+                    Label("Готово", systemImage: "checkmark")
                 }
-                Spacer()
-                Button(role: .destructive) {
+                .buttonStyle(SoftPillButtonStyle(tint: Soft.ok))
+                .accessibilityLabel("Фраза готова")
+                Spacer(minLength: 0)
+                Button {
+                    vm.speakPhrase()
+                } label: {
+                    Image(systemName: "play.fill")
+                }
+                .buttonStyle(SoftIconButtonStyle(size: 42))
+                .accessibilityLabel("Произнести")
+                Button {
+                    vm.isSpeechEnabled.toggle()
+                } label: {
+                    Image(systemName: vm.isSpeechEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                }
+                .buttonStyle(SoftIconButtonStyle(size: 42))
+                .accessibilityLabel(vm.isSpeechEnabled ? "Выключить голос" : "Включить голос")
+                Button {
                     vm.clearTranslation()
                 } label: {
                     Image(systemName: "trash")
                 }
+                .buttonStyle(SoftIconButtonStyle(size: 42, iconColor: Soft.alert))
+                .accessibilityLabel("Очистить")
             }
-            .buttonStyle(.bordered)
-            .font(.subheadline)
+            .lineLimit(1)
 
             if !vm.phraseHistory.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
@@ -322,13 +341,13 @@ struct ContentView: View {
                 }
             }
 
-            Text("Опустите руки на 2 секунды — фраза закончится сама")
-                .font(.caption2)
+            Label("Опустите руки на 2 секунды — фраза закончится сама", systemImage: "hand.raised")
+                .font(.caption)
                 .foregroundStyle(.secondary)
         }
-        .padding(16)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-        .animation(.snappy, value: vm.phraseWords)
+        .padding(18)
+        .softCard(cornerRadius: 30)
+        .animation(Soft.animation, value: vm.phraseWords)
     }
 
     // MARK: Режим «Управление» (демо-интерфейс)
@@ -341,8 +360,8 @@ struct ContentView: View {
                 Image(systemName: screen.icon)
                     .font(.title2)
                     .frame(width: 44, height: 44)
-                    .background(Color.accentColor.opacity(0.25),
-                                in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .background(Soft.accent.opacity(0.25),
+                                in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(screen.title).font(.title3.bold())
                     Text("Экран \(vm.screenIndex + 1) из \(vm.screens.count)")
@@ -353,7 +372,7 @@ struct ContentView: View {
                 if vm.selectedIndex == vm.screenIndex {
                     Label("Выбран", systemImage: "checkmark.circle.fill")
                         .font(.caption.bold())
-                        .foregroundStyle(.green)
+                        .foregroundStyle(Soft.ok)
                 }
             }
 
@@ -379,7 +398,7 @@ struct ContentView: View {
             if let confirmation = vm.confirmation {
                 Label(confirmation, systemImage: "checkmark.seal.fill")
                     .font(.subheadline)
-                    .foregroundStyle(.green)
+                    .foregroundStyle(Soft.ok)
             }
 
             if !vm.log.isEmpty {
@@ -392,10 +411,10 @@ struct ContentView: View {
                 }
             }
         }
-        .padding(16)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-        .animation(.snappy, value: vm.screenIndex)
-        .animation(.snappy, value: vm.volume)
+        .padding(18)
+        .softCard(cornerRadius: 30)
+        .animation(Soft.animation, value: vm.screenIndex)
+        .animation(Soft.animation, value: vm.volume)
     }
 
     private func errorOverlay(_ message: String) -> some View {
@@ -403,8 +422,8 @@ struct ContentView: View {
             Image(systemName: "camera.fill").font(.largeTitle)
             Text(message).multilineTextAlignment(.center)
         }
-        .padding(24)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .padding(26)
+        .softCard()
         .padding(32)
     }
 }
@@ -426,7 +445,7 @@ struct GestureHelpView: View {
                     Text("Разные люди: приложение сравнивает углы сгиба пальцев, а не их длину, и понимает левую руку как зеркало правой. Для лучшей точности запишите одно слово у 2–3 разных людей.")
                     Text("Разные ракурсы: записывайте жесты «С трёх ракурсов». Если палец скрыт при повороте, он учитывается слабее, а не ломает распознавание.")
                     Text("Жест одной рукой: вторую руку можно держать опущенной — на столе или на коленях. Неподвижная опущенная рука не учитывается (на экране она серая). Как только она поднимается или двигается, жест считается жестом двумя руками.")
-                    Text("Если новый жест похож на уже записанное слово, приложение предупредит об этом после записи.")
+                    Text("Если новый жест похож на уже записанное слово, приложение предупредит об этом после записи. Похожие слова (например, одна форма кисти у подбородка и у груди) распознаются строже, чтобы их не путать, а поза засчитывается, только когда пальцы перестали двигаться — переходы между жестами не превращаются в лишние слова.")
                     Text("Подсказка «Похоже на «слово» — N%»: 100% — жест достаточно похож, чтобы засчитаться. Если процент держится ниже, сдвиньте «Чувствительность» вправо или запишите слово ещё раз — лучше тем же человеком и при том же свете. Для жестов с движением в скобках бывает причина отказа: «мало движения» — покажите с тем же размахом, что при записи; «слишком быстро» — медленнее.")
                     Text("Плечи: приложение само находит плечи на каждом кадре (линия между плечами) и учитывает, где руки относительно тела. Чтобы это работало, в кадре должны быть видны плечи. Отключить — «Словарь» → «Учитывать плечи».")
                 }
@@ -435,6 +454,7 @@ struct GestureHelpView: View {
                 Section("Речь → текст") {
                     Text("Кнопка «Речь → текст» в панели перевода открывает голосовой перевод: всё, что говорят вокруг, сразу появляется на экране крупным текстом. Когда говорят несколько человек, каждая реплика после паузы — с новой строки.")
                     Text("Запинки, повторы и звуки-паузы («э-э») убираются. Имена и редкие слова добавьте в «Мои слова» (кнопка «…») — тогда они распознаются точнее и исправляются, если распознаны с ошибкой.")
+                    Text("Дальняя речь: кнопка с ухом (включена сразу) усиливает тихий и далёкий голос — до 10 метров в тихом помещении — и убирает низкий гул. Положите телефон микрофоном (низом) к говорящему. В шуме или на улице дайте говорящему наушники Bluetooth с микрофоном и включите «Микрофон Bluetooth» (кнопка «…»).")
                 }
                 .font(.footnote)
 
@@ -594,7 +614,7 @@ struct HoldRing: View {
                 .stroke(.white.opacity(0.2), lineWidth: 5)
             Circle()
                 .trim(from: 0, to: live.holdProgress)
-                .stroke(Color.green, style: StrokeStyle(lineWidth: 5, lineCap: .round))
+                .stroke(Soft.ok, style: StrokeStyle(lineWidth: 5, lineCap: .round))
                 .rotationEffect(.degrees(-90))
             Text(emoji)
                 .font(.system(size: 28))
@@ -610,9 +630,7 @@ struct FPSLabel: View {
     var body: some View {
         Text("\(live.fps) FPS · \(isFront ? "фронт." : "задняя")")
             .font(.caption.monospacedDigit())
-            .foregroundStyle(.white)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(.ultraThinMaterial, in: Capsule())
+            .foregroundStyle(.white.opacity(0.8))
+            .softChip()
     }
 }
