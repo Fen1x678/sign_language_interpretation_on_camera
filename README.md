@@ -1,3 +1,8 @@
+<p align="right">
+  <a href="README.en.md"><img alt="ENG" src="https://img.shields.io/badge/ENG-English-1f6feb?style=for-the-badge"></a>
+  <a href="README.md"><img alt="RUS" src="https://img.shields.io/badge/RUS-%D0%A0%D1%83%D1%81%D1%81%D0%BA%D0%B8%D0%B9-2ea043?style=for-the-badge"></a>
+</p>
+
 # GestureControl
 
 **Сурдоперевод, бесконтактное управление жестами и «Речь → текст» на iPhone и Android**
@@ -6,13 +11,13 @@
 
 > 📱 **iPhone** — iOS 17 или новее, ветка [`beta-0.46`](../../tree/beta-0.46).
 >
-> 🤖 **Android** — Android 8.0 или новее, ветка [`beta-0.46_only_android`](../../tree/beta-0.46_only_android/Android) (папка `Android`). Установка — в [инструкции для Android](../../blob/beta-0.46_only_android/Android/README.md).
+> 🤖 **Android** — Android 8.0 или новее: теперь в отдельном репозитории [**SignSpeech/Android**](https://github.com/SignSpeech/Android) (версия beta-0.6, инструкция на русском и английском).
 >
 > iPad, Mac и симулятор не поддерживаются: в симуляторе нет камеры.
 
-> 🆕 **Текущая версия — beta-0.46**: для iPhone — ветка [`beta-0.46`](../../tree/beta-0.46), для Android — ветка [`beta-0.46_only_android`](../../tree/beta-0.46_only_android). Что изменилось — в разделе [«Что нового»](#что-нового-в-beta-046).
+> 🆕 **Текущая версия — beta-0.46** для iPhone (ветка [`beta-0.46`](../../tree/beta-0.46)) и **beta-0.6** для Android ([SignSpeech/Android](https://github.com/SignSpeech/Android)). Что изменилось — в разделе [«Что нового»](#что-нового-в-beta-046).
 >
-> 📦 **Код последней версии лежит в ветках `beta-0.46` (iPhone) и `beta-0.46_only_android` (Android).** В ветке `main` — первая версия приложения. Чтобы установить последнюю версию, скачайте нужную ветку (см. раздел [«Установка и запуск»](#установка-и-запуск)).
+> 📦 **Код последней версии для iPhone лежит в ветке `beta-0.46`.** В ветке `main` — первая версия приложения. Чтобы установить последнюю версию, скачайте нужную ветку (см. раздел [«Установка и запуск»](#установка-и-запуск)).
 
 ---
 
@@ -238,7 +243,7 @@ GestureControl распознаёт руки через камеру iPhone и �
 
 Приложения пока нет в App Store, поэтому его собирают из исходного кода через Xcode. Это займёт 5–10 минут.
 
-> 🤖 **Для Android** — другая ветка и Android Studio вместо Xcode: пошаговая [инструкция для Android](../../blob/beta-0.46_only_android/Android/README.md).
+> 🤖 **Для Android** — репозиторий [SignSpeech/Android](https://github.com/SignSpeech/Android): пошаговая инструкция, Android Studio вместо Xcode.
 
 ### 1. Скачайте проект
 
@@ -390,16 +395,18 @@ git clone -b beta-0.46 https://github.com/Fen1x678/sign_language_interpretation_
 - [ ] Экспорт и импорт словаря, обмен словарями между пользователями.
 - [x] Положение рук относительно плеч (beta-0.25).
 - [ ] Учёт мимики и положения рук относительно лица.
-- [x] Версия для Android (beta-0.45_only_android).
+- [x] Версия для Android ([SignSpeech/Android](https://github.com/SignSpeech/Android)).
+- [ ] Интерфейс и распознавание речи на английском.
 - [ ] Публикация в TestFlight и App Store.
 
 ## Структура проекта
 
-Файлы последней версии для iPhone (ветка `beta-0.46`). Версия для Android — в ветке `beta-0.46_only_android`, папка [`Android`](../../tree/beta-0.46_only_android/Android), её устройство описано в [инструкции для Android](../../blob/beta-0.46_only_android/Android/README.md).
+Файлы последней версии для iPhone (ветка `beta-0.46`). Версия для Android — в репозитории [SignSpeech/Android](https://github.com/SignSpeech/Android).
 
 ```
 sign_language_interpretation_on_camera/
-├── README.md
+├── README.md, README.en.md          — описание на русском и английском
+├── LICENSE
 └── GestureControl/
     ├── GestureControl.xcodeproj      — проект Xcode (приложение на iPhone называется «speech»)
     └── GestureControl/
@@ -409,11 +416,14 @@ sign_language_interpretation_on_camera/
         ├── GestureRecognizer.swift   — геометрия кисти, встроенные жесты, свайпы, удержание
         ├── HandFeatures.swift        — признаки позы и движения, DTW
         ├── SignLibrary.swift         — сглаживание, словарь жестов, k-NN и пороги
+        ├── PoseSteadiness.swift      — поза засчитывается, только когда кисть устоялась
+        ├── RestingHandFilter.swift   — опущенная вторая рука не учитывается
         ├── GestureViewModel.swift    — логика: перевод, запись жестов, подсветка, команды
         ├── VoiceTranslator.swift     — «Речь → текст»: распознавание речи, реплики по паузам, режим звонка
         ├── SpeechCorrector.swift     — исправление распознанной речи: запинки, повторы, свои слова
         ├── SpeechView.swift          — страница «Речь → текст»
         ├── GestureModels.swift       — типы жестов и команд
+        ├── Theme.swift               — мягкие цвета, карточки, кнопки
         ├── ContentView.swift         — интерфейс
         └── CameraPreview.swift       — изображение с камеры и скелет рук
 ```
@@ -448,7 +458,7 @@ sign_language_interpretation_on_camera/
 
 ## Обратная связь
 
-Нашли ошибку или хотите предложить улучшение? Создайте [Issue](../../issues) и опишите:
+Нашли ошибку или хотите предложить улучшение? Создайте [Issue](../../issues) (можно на русском или английском) и опишите:
 
 - модель iPhone и версию iOS;
 - что делали и что произошло;
