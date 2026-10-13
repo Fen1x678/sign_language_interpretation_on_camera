@@ -40,19 +40,36 @@ class HandTracker(private val context: Context) : Closeable {
     private var useGpu = true
     private var lastHandTime = 0L
     private var lastPoseTime = 0L
+    /** Плечи ищутся раз в [POSE_EVERY] кадров: они двигаются медленно, а поиск тела почти так же тяжёл, как поиск рук. */
+    private var framesSincePose = POSE_EVERY
+    private var lastShoulders: List<Pt>? = null
 
     class Result(val hands: List<CameraHand>, val shoulders: List<Pt>?)
 
     /**
      * [bitmap] — кадр так, как он показан на экране (для фронтальной камеры — зеркально).
+     * Картинка переиспользуется на следующих кадрах, поэтому её нельзя освобождать.
      * [mirrored] — кадр отражён (фронтальная камера): тогда MediaPipe определяет руку правильно,
      * а для незеркального кадра задней камеры правую и левую руки нужно поменять местами.
      */
     fun detect(bitmap: Bitmap, withShoulders: Boolean, mirrored: Boolean): Result {
+        // MPImage не закрываем: close() освободил бы картинку, а она нужна на следующих кадрах.
+        // MediaPipe копирует пиксели и не хранит ссылку на картинку после вызова.
         val image = BitmapImageBuilder(bitmap).build()
         return try {
             val found = detectHands(image, mirrored)
-            val shoulders = if (withShoulders) detectShoulders(image) else null
+            val shoulders = if (withShoulders) {
+                framesSincePose += 1
+                if (framesSincePose >= POSE_EVERY) {
+                    framesSincePose = 0
+                    lastShoulders = detectShoulders(image)
+                }
+                lastShoulders
+            } else {
+                framesSincePose = POSE_EVERY
+                lastShoulders = null
+                null
+            }
             Result(found, shoulders)
         } catch (e: RuntimeException) {
             // Видеоускоритель на некоторых телефонах работает с ошибками — переходим на процессор.
@@ -62,8 +79,6 @@ class HandTracker(private val context: Context) : Closeable {
                 close()
             }
             Result(emptyList(), null)
-        } finally {
-            image.close()
         }
     }
 
@@ -176,5 +191,6 @@ class HandTracker(private val context: Context) : Closeable {
 
     private companion object {
         const val TAG = "HandTracker"
+        const val POSE_EVERY = 3
     }
 }

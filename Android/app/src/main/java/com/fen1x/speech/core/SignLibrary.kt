@@ -48,12 +48,23 @@ class SignLibrary {
         /** Укороченные записи с движением — для быстрого сравнения с другими словами. */
         val motionProbes: List<MotionTemplate>,
     ) {
+        /** Те же укороченные записи как поток кадров (чтобы не готовить их заново для каждой пары слов). */
+        val probeStreams: List<MotionStream> = motionProbes.map { MotionStream(it.frames) }
+
         /** Порог с учётом похожих слов словаря (см. [updateNeighbourLimits]). */
         var poseThreshold: Float = ownPoseThreshold
         var motionThreshold: Float = ownMotionThreshold
     }
 
     private val cache = HashMap<String, Cache>()
+
+    /**
+     * Насколько близко записи слова `other` подходят к слову `id`: [id][other].
+     * Считается один раз для каждой пары слов; после записи или удаления слова пересчитываются
+     * только пары с этим словом, а не весь словарь.
+     */
+    private val poseMargins = HashMap<String, HashMap<String, Float>>()
+    private val motionMargins = HashMap<String, HashMap<String, Float>>()
 
     /** Самое похожее слово на последних сравнениях — для подсказки на экране. */
     data class Candidate(val word: String, val ratio: Float, val reason: String?)
@@ -85,6 +96,7 @@ class SignLibrary {
 
     fun delete(id: String) {
         cache.remove(id)
+        forgetMargins(id)
         signs = signs.filter { it.id != id }
         updateMotionWindow()
         updateNeighbourLimits()
@@ -181,14 +193,16 @@ class SignLibrary {
         for (sign in signs) {
             val c = cache[sign.id] ?: continue
             if (c.motions.isEmpty()) continue
+            for (template in c.motions) template.liveCache.nextGeneration()
             val limit = c.motionThreshold * scale
             var best = Float.POSITIVE_INFINITY
             var rejected: Rejected? = null
             for (template in c.motions) {
                 for (stream in usable) {
                     if (stream.handCount != template.handCount) continue
-                    // Если жест заведомо не подходит, DTW прекращается досрочно.
-                    val result = template.cost(stream, min(best, limit * 2))
+                    // Если жест заведомо не подходит, DTW прекращается досрочно. Расстояния до кадров,
+                    // которые уже были в потоке на прошлых кадрах, берутся из кэша шаблона.
+                    val result = template.cost(stream, min(best, limit * 2), template.liveCache)
                     best = min(best, result.cost)
                     val r = result.rejected
                     if (r != null && r.cost < (rejected?.cost ?: Float.POSITIVE_INFINITY)) rejected = r
@@ -264,7 +278,16 @@ class SignLibrary {
 
     // MARK: Кэш признаков и пороги
 
+    /** Слово изменилось или удалено: его пары с другими словами нужно посчитать заново. */
+    private fun forgetMargins(id: String) {
+        poseMargins.remove(id)
+        motionMargins.remove(id)
+        for (row in poseMargins.values) row.remove(id)
+        for (row in motionMargins.values) row.remove(id)
+    }
+
     private fun rebuildCache(sign: CustomSign) {
+        forgetMargins(sign.id)
         // Позы: из каждой записи берём поровну кадров, чтобы ни одна запись не «перевешивала».
         val groups = sign.poseGroups
         val perGroup = max(8, MAX_POSE_FRAMES / max(1, groups.size))
@@ -291,22 +314,36 @@ class SignLibrary {
         for ((id, c) in entries) {
             var poseMargin = Float.POSITIVE_INFINITY
             var motionMargin = Float.POSITIVE_INFINITY
+            val poseRow = poseMargins.getOrPut(id) { HashMap() }
+            val motionRow = motionMargins.getOrPut(id) { HashMap() }
             for ((otherId, other) in entries) {
                 if (otherId == id) continue
                 // Насколько записи другого слова похожи на это слово (так же, как при распознавании).
-                if (c.poses.isNotEmpty()) {
-                    for (query in other.poseMedoids) {
-                        poseMargin = min(poseMargin, poseCost(query, query.mirrored(), c.poses))
-                    }
-                }
-                if (c.motionProbes.isNotEmpty()) {
-                    for (query in other.motionProbes) {
-                        val stream = MotionStream(query.frames)
-                        for (template in c.motionProbes) {
-                            motionMargin = min(motionMargin, template.cost(stream).cost)
+                val pose = poseRow.getOrPut(otherId) {
+                    var margin = Float.POSITIVE_INFINITY
+                    if (c.poses.isNotEmpty()) {
+                        for (query in other.poseMedoids) {
+                            margin = min(margin, poseCost(query, query.mirrored(), c.poses))
                         }
                     }
+                    margin
                 }
+                poseMargin = min(poseMargin, pose)
+                val motion = motionRow.getOrPut(otherId) {
+                    // Сосед дальше этого расстояния порог не меняет (см. neighbourLimit) — такие
+                    // сравнения DTW прекращает досрочно, а результат тот же.
+                    val cap = c.ownMotionThreshold / SignMatching.NEIGHBOUR_SHARE
+                    var margin = Float.POSITIVE_INFINITY
+                    if (c.motionProbes.isNotEmpty()) {
+                        for (stream in other.probeStreams) {
+                            for (template in c.motionProbes) {
+                                margin = min(margin, template.cost(stream, min(margin, cap)).cost)
+                            }
+                        }
+                    }
+                    margin
+                }
+                motionMargin = min(motionMargin, motion)
             }
             c.poseThreshold = neighbourLimit(c.ownPoseThreshold, poseMargin, SignMatching.BASE_POSE_THRESHOLD)
             c.motionThreshold = neighbourLimit(c.ownMotionThreshold, motionMargin, SignMatching.BASE_MOTION_THRESHOLD)
@@ -331,6 +368,8 @@ class SignLibrary {
         }
         signs = saved
         cache.clear()
+        poseMargins.clear()
+        motionMargins.clear()
         for (sign in signs) rebuildCache(sign)
         updateNeighbourLimits()
         return true
@@ -374,21 +413,34 @@ class SignLibrary {
 
         /** Среднее расстояние до трёх ближайших кадров позы (в обычном или зеркальном виде). */
         private fun poseCost(live: FrameFeatures, mirrored: FrameFeatures, poses: List<FrameFeatures>): Float {
+            // k ближайших (по возрастанию) без выделения памяти на каждом кадре.
             val k = SignMatching.POSE_NEIGHBOURS
-            val nearest = ArrayList<Float>(k + 1)
+            val nearest = FloatArray(k)
+            var count = 0
             for (pose in poses) {
                 val d = min(FrameFeatures.shapeDistance(live, pose), FrameFeatures.shapeDistance(mirrored, pose))
                 if (!d.isFinite()) continue
-                if (nearest.size < k) {
-                    nearest.add(d)
-                    nearest.sort()
+                if (count < k) {
+                    var i = count
+                    while (i > 0 && nearest[i - 1] > d) {
+                        nearest[i] = nearest[i - 1]
+                        i -= 1
+                    }
+                    nearest[i] = d
+                    count += 1
                 } else if (d < nearest[k - 1]) {
-                    nearest[k - 1] = d
-                    nearest.sort()
+                    var i = k - 1
+                    while (i > 0 && nearest[i - 1] > d) {
+                        nearest[i] = nearest[i - 1]
+                        i -= 1
+                    }
+                    nearest[i] = d
                 }
             }
-            if (nearest.isEmpty()) return Float.POSITIVE_INFINITY
-            return nearest.sum() / nearest.size
+            if (count == 0) return Float.POSITIVE_INFINITY
+            var sum = 0f
+            for (i in 0 until count) sum += nearest[i]
+            return sum / count
         }
 
         /**

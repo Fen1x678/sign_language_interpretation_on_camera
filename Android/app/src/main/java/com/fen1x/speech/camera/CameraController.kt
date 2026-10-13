@@ -2,7 +2,10 @@ package com.fen1x.speech.camera
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.RectF
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
@@ -24,9 +27,11 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.log2
+import kotlin.math.roundToInt
 
 /**
  * Блоки структурной схемы: «Камера → Получение видеокадров → Обнаружение руки → Определение ключевых точек».
@@ -57,6 +62,16 @@ class CameraController(private val context: Context) {
     private var camera: Camera? = null
     private var tracker: HandTracker? = null
     private var bindToken = 0
+
+    // Картинки кадра переиспользуются (только на потоке камеры). Раньше на каждом кадре создавались
+    // две новые картинки по ~1,2 МБ — около 70 МБ в секунду, и сборка мусора вызывала подёргивания.
+    private var sourceBitmap: Bitmap? = null
+    private var packedPixels: ByteBuffer? = null
+    private var uprightBitmap: Bitmap? = null
+    private var uprightCanvas: Canvas? = null
+    private val uprightMatrix = Matrix()
+    private val uprightBounds = RectF()
+    private val uprightPaint = Paint(Paint.FILTER_BITMAP_FLAG)
 
     /** Яркость сцены по выдержке, светочувствительности и диафрагме (обновляется на каждом кадре). */
     @Volatile
@@ -164,18 +179,13 @@ class CameraController(private val context: Context) {
     /** Кадр → точки рук и плеч (поток камеры). */
     private fun analyze(image: ImageProxy, front: Boolean) {
         try {
-            val bitmap = image.toBitmap()
+            val bitmap = sourcePixels(image)
             val crop = image.cropRect
-            // Поворачиваем как на экране; фронтальную камеру экран показывает зеркально — отражаем так же.
-            val matrix = Matrix().apply {
-                postRotate(image.imageInfo.rotationDegrees.toFloat())
-                if (front) postScale(-1f, 1f)
-            }
             val left = crop.left.coerceIn(0, bitmap.width - 1)
             val top = crop.top.coerceIn(0, bitmap.height - 1)
             val width = crop.width().coerceIn(1, bitmap.width - left)
             val height = crop.height().coerceIn(1, bitmap.height - top)
-            val upright: Bitmap = Bitmap.createBitmap(bitmap, left, top, width, height, matrix, true)
+            val upright = upright(bitmap, left, top, width, height, image.imageInfo.rotationDegrees, front)
             val tracker = tracker ?: HandTracker(context).also { tracker = it }
             val result = tracker.detect(upright, bodyTracking, front)
             onFrame?.invoke(CameraFrame(result.hands, brightness, result.shoulders))
@@ -184,6 +194,67 @@ class CameraController(private val context: Context) {
         } finally {
             image.close()
         }
+    }
+
+    /** Пиксели кадра (RGBA) в переиспользуемой картинке. */
+    private fun sourcePixels(image: ImageProxy): Bitmap {
+        val plane = image.planes.firstOrNull()
+        if (plane == null || plane.pixelStride != 4) return image.toBitmap()   // необычный формат — как раньше
+        val width = image.width
+        val height = image.height
+        val bitmap = sourceBitmap?.takeIf { it.width == width && it.height == height && !it.isRecycled }
+            ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { sourceBitmap = it }
+        val rowBytes = width * 4
+        val buffer = plane.buffer
+        buffer.rewind()
+        if (plane.rowStride == rowBytes && buffer.remaining() >= rowBytes * height) {
+            bitmap.copyPixelsFromBuffer(buffer)
+        } else {
+            // Строки кадра с отступами в конце — собираем их подряд.
+            val packed = packedPixels?.takeIf { it.capacity() == rowBytes * height }
+                ?: ByteBuffer.allocateDirect(rowBytes * height).also { packedPixels = it }
+            packed.clear()
+            for (row in 0 until height) {
+                val start = row * plane.rowStride
+                buffer.limit(buffer.capacity())
+                buffer.position(start)
+                buffer.limit(start + rowBytes)
+                packed.put(buffer)
+            }
+            buffer.limit(buffer.capacity())
+            packed.flip()
+            bitmap.copyPixelsFromBuffer(packed)
+        }
+        return bitmap
+    }
+
+    /**
+     * Видимая часть кадра, повёрнутая как на экране (фронтальная камера — зеркально, как её показывает экран),
+     * в переиспользуемой картинке. То же, что Bitmap.createBitmap(..., matrix, true), но без новой картинки.
+     */
+    private fun upright(source: Bitmap, left: Int, top: Int, width: Int, height: Int, rotation: Int, front: Boolean): Bitmap {
+        val matrix = uprightMatrix
+        matrix.reset()
+        matrix.postRotate(rotation.toFloat())
+        if (front) matrix.postScale(-1f, 1f)
+        val bounds = uprightBounds
+        bounds.set(0f, 0f, width.toFloat(), height.toFloat())
+        matrix.mapRect(bounds)
+        val outWidth = bounds.width().roundToInt().coerceAtLeast(1)
+        val outHeight = bounds.height().roundToInt().coerceAtLeast(1)
+        matrix.preTranslate(-left.toFloat(), -top.toFloat())
+        matrix.postTranslate(-bounds.left, -bounds.top)
+
+        var bitmap = uprightBitmap
+        var canvas = uprightCanvas
+        if (bitmap == null || canvas == null || bitmap.width != outWidth || bitmap.height != outHeight || bitmap.isRecycled) {
+            bitmap = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
+            canvas = Canvas(bitmap)
+            uprightBitmap = bitmap
+            uprightCanvas = canvas
+        }
+        canvas.drawBitmap(source, matrix, uprightPaint)
+        return bitmap
     }
 
     private companion object {

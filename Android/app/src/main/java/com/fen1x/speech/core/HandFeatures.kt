@@ -37,9 +37,25 @@ class FrameFeatures private constructor(
     val chirality: IntArray,
     /** Направление движения ведущей руки (2 числа, от −1 до 1). Пусто для позы. */
     val motion: FloatArray,
+    /**
+     * Номер кадра: у каждого кадра свой, у зеркального — тот же с флагом [MIRROR_BIT].
+     * По нему запоминаются уже посчитанные расстояния (см. [DistanceCache]).
+     */
+    val key: Long = nextKey(),
 ) {
+    /** Зеркальный кадр считается один раз (признаки кадра не меняются). */
+    private var mirror: FrameFeatures? = null
+
     /** Зеркальное отражение: жест левой руки ↔ тот же жест правой рукой. */
     fun mirrored(): FrameFeatures {
+        mirror?.let { return it }
+        val result = makeMirrored()
+        result.mirror = this
+        mirror = result
+        return result
+    }
+
+    private fun makeMirrored(): FrameFeatures {
         val v = values.copyOf()
         val w = weights.copyOf()
         val n = HAND_LENGTH
@@ -58,7 +74,7 @@ class FrameFeatures private constructor(
         }
         val c = IntArray(chirality.size) { -chirality[chirality.size - 1 - it] }
         val m = if (motion.size == 2) floatArrayOf(-motion[0], motion[1]) else motion
-        return FrameFeatures(v, w, handCount, c, m)
+        return FrameFeatures(v, w, handCount, c, m, key xor MIRROR_BIT)
     }
 
     /** Какая рука показывает жест: +1 правая, −1 левая, 0 — неизвестно или две руки. */
@@ -76,6 +92,11 @@ class FrameFeatures private constructor(
         const val HAND_LENGTH = 33
         const val ORIENT_X = 29
         const val LOCATION_X = 31
+        /** Флаг зеркального кадра в [key]. */
+        const val MIRROR_BIT = 1L shl 62
+
+        private val keys = java.util.concurrent.atomic.AtomicLong()
+        private fun nextKey(): Long = keys.incrementAndGet()
 
         val handWeights: FloatArray = run {
             val w = ArrayList<Float>()
@@ -440,22 +461,35 @@ object SignMatching {
         t: List<FrameFeatures>,
         s: List<FrameFeatures>,
         abandonAbove: Float = Float.POSITIVE_INFINITY,
+        cache: DistanceCache? = null,
     ): DtwResult {
         val n = t.size
         val m = s.size
         if (n <= 1 || m <= 1) return DtwResult(Float.POSITIVE_INFINITY, 0)
+        // Расстояния до кадров потока, посчитанные на прошлых кадрах камеры, берутся из кэша:
+        // поток сдвигается на один кадр, поэтому заново считается почти только новый столбец.
+        val columns: Array<FloatArray>? = cache?.let { c -> Array(m) { c.column(s[it]) } }
+        fun dist(i: Int, j: Int): Float {
+            if (columns == null) return FrameFeatures.distance(t[i], s[j])
+            val column = columns[j]
+            val known = column[i]
+            if (!known.isNaN()) return known
+            val value = FrameFeatures.distance(t[i], s[j])
+            column[i] = value
+            return value
+        }
         val limit = abandonAbove * n
         var prev = FloatArray(m)
         var cur = FloatArray(m)
         var prevStart = IntArray(m) { it }   // жест может начаться на любом кадре потока
         var curStart = IntArray(m)
-        for (j in 0 until m) prev[j] = FrameFeatures.distance(t[0], s[j])
+        for (j in 0 until m) prev[j] = dist(0, j)
         for (i in 1 until n) {
-            cur[0] = prev[0] + FrameFeatures.distance(t[i], s[0])
+            cur[0] = prev[0] + dist(i, 0)
             curStart[0] = prevStart[0]
             var rowMin = cur[0]
             for (j in 1 until m) {
-                val d = FrameFeatures.distance(t[i], s[j])
+                val d = dist(i, j)
                 val faster = prev[j] + d                          // шаблон идёт дальше, поток стоит
                 val same = prev[j - 1] + d                        // оба идут дальше
                 val slower = cur[j - 1] + SLOW_STEP_WEIGHT * d    // поток идёт дальше, шаблон стоит
@@ -498,6 +532,45 @@ enum class MotionRejection(val title: String) {
 
 data class Rejected(val cost: Float, val reason: MotionRejection)
 
+/**
+ * Расстояния от кадров записанного жеста до кадров потока, уже посчитанные на прошлых кадрах камеры.
+ *
+ * Поток последних кадров на каждом кадре камеры сдвигается всего на один кадр, а остальные кадры
+ * остаются теми же. Без кэша расстояния до них считались бы заново на каждом кадре — это самая
+ * тяжёлая часть распознавания жестов с движением. Результат DTW с кэшем и без него одинаковый.
+ * Кадры, которые ушли из потока, забываются через несколько сравнений.
+ */
+class DistanceCache(private val length: Int) {
+    private class Column(val values: FloatArray, var used: Int)
+
+    private val columns = HashMap<Long, Column>()
+    private var generation = 0
+
+    /** Начало нового сравнения (новый кадр камеры): старые столбцы забываются. */
+    fun nextGeneration() {
+        generation += 1
+        if (columns.size > MAX_COLUMNS) {
+            val oldest = generation - KEEP_GENERATIONS
+            columns.values.removeAll { it.used < oldest }
+        }
+    }
+
+    /** Расстояния от кадров шаблона до кадра потока (NaN — ещё не посчитано). */
+    fun column(frame: FrameFeatures): FloatArray {
+        val column = columns.getOrPut(frame.key) { Column(FloatArray(length) { Float.NaN }, generation) }
+        column.used = generation
+        return column.values
+    }
+
+    val size: Int get() = columns.size
+
+    private companion object {
+        /** Не меньше кадров потока (до 45) × обычный и зеркальный × два потока. */
+        const val MAX_COLUMNS = 240
+        const val KEEP_GENERATIONS = 4
+    }
+}
+
 /** Результат сравнения шаблона с потоком кадров. */
 data class MotionCost(
     /** Стоимость DTW (меньше — похоже сильнее); бесконечность — не подходит. */
@@ -524,6 +597,8 @@ class MotionStream(val frames: List<FrameFeatures>) {
 /** Записанный жест с движением, подготовленный для сравнения. */
 class MotionTemplate private constructor(val frames: List<FrameFeatures>) {
     val handCount: Int = frames[frames.size - 1].handCount
+    /** Расстояния до кадров потока, посчитанные на прошлых кадрах (только для распознавания вживую). */
+    val liveCache = DistanceCache(frames.size)
     /** Средняя скорость руки (ладоней в секунду). */
     val speedActivity: Float
     /** Средняя скорость изменения формы кисти. */
@@ -543,7 +618,11 @@ class MotionTemplate private constructor(val frames: List<FrameFeatures>) {
      * • в найденном отрезке есть движение (или смена формы — для жестов почти без перемещения руки),
      *   как в шаблоне: неподвижная рука не должна совпадать с жестом с движением.
      */
-    fun cost(stream: MotionStream, abandonAbove: Float = Float.POSITIVE_INFINITY): MotionCost {
+    fun cost(
+        stream: MotionStream,
+        abandonAbove: Float = Float.POSITIVE_INFINITY,
+        cache: DistanceCache? = null,
+    ): MotionCost {
         var cost = Float.POSITIVE_INFINITY
         var rejected: Rejected? = null
         if (stream.handCount != handCount) return MotionCost()
@@ -558,7 +637,7 @@ class MotionTemplate private constructor(val frames: List<FrameFeatures>) {
             else -> listOf(stream.mirrored to 1f, stream.frames to penalty)
         }
         for ((candidate, extra) in candidates) {
-            val dtw = SignMatching.subsequenceDTW(frames, candidate, min(cost, abandonAbove) / extra)
+            val dtw = SignMatching.subsequenceDTW(frames, candidate, min(cost, abandonAbove) / extra, cache)
             val c = dtw.cost * extra
             if (!c.isFinite() || c >= cost) continue
             val reason = rejection(dtw.start, candidate.size, stream)

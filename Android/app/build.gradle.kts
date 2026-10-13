@@ -13,8 +13,8 @@ android {
         applicationId = "com.fen1x.speech"
         minSdk = 26
         targetSdk = 35
-        versionCode = 46
-        versionName = "beta-0.46"
+        versionCode = 70
+        versionName = "beta-0.7"
     }
 
     buildTypes {
