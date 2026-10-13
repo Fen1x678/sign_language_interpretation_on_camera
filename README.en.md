@@ -11,17 +11,30 @@
 
 > 🌍 **Language of the app.** The app's interface is in **Russian**, the voice that reads translations aloud is Russian, and speech-to-text currently recognises **Russian**. Sign translation works with any sign language: you teach the app your own signs and type the words for them in any language (words in other languages are read aloud by the Russian voice). This guide gives the English meaning of every button.
 
-> 📱 **iPhone** — iOS 17 or later, branch [`beta-0.46`](../../tree/beta-0.46).
+> 📱 **iPhone** — iOS 17 or later, branch [`beta-0.7`](../../tree/beta-0.7).
 >
-> 🤖 **Android** — Android 8.0 or later: now lives in its own repository, [**SignSpeech/Android**](https://github.com/SignSpeech/Android) (version beta-0.6, guide in English and Russian).
+> 🤖 **Android** — Android 8.0 or later: now lives in its own repository, [**SignSpeech/Android**](https://github.com/SignSpeech/Android) (version beta-0.7, guide in English and Russian).
 >
 > iPad, Mac and the simulator are not supported: the simulator has no camera.
 
-> 🆕 **Current version — beta-0.46** for iPhone (branch [`beta-0.46`](../../tree/beta-0.46)) and **beta-0.6** for Android ([SignSpeech/Android](https://github.com/SignSpeech/Android)). See [What's new](#whats-new-in-beta-046).
+> 🆕 **Current version — beta-0.7** for iPhone (branch [`beta-0.7`](../../tree/beta-0.7)) and for Android ([SignSpeech/Android](https://github.com/SignSpeech/Android)). See [What's new](#whats-new-in-beta-07).
 >
-> 📦 **The latest code is in the `beta-0.46` branch (iPhone).** The `main` branch holds the first version of the app. To install the latest version, download that branch (see [Installation](#installation)).
+> 📦 **The latest code is in the `beta-0.7` branch (iPhone).** The `main` branch holds the first version of the app. To install the latest version, download that branch (see [Installation](#installation)).
 
 ---
+
+## What's new in beta-0.7
+
+**Update for iPhone and Android** — iPhone: branch [`beta-0.7`](../../tree/beta-0.7); Android: [SignSpeech/Android](https://github.com/SignSpeech/Android) (branch `beta-0.7`). Recorded signs are kept. Recognition works exactly as in beta-0.46 — just faster.
+
+**⚡ No more lag**
+- **Moving signs are recognised 5× faster.** Previously, on every frame the app compared the last 2–3 seconds with all recorded signs from scratch, and with a large dictionary the screen stuttered. Now work already done is remembered, and each new frame computes only what is new. The result is identical to the last digit — verified by tests.
+- **The pause after recording a new sign is about 10× shorter.** Previously the app re-compared all dictionary words with each other after a recording; now it compares only the new word with the others.
+- **The dictionary loads faster at start-up:** words that are clearly different stop being compared as soon as that's certain.
+- **Smoother camera.** Shoulders are searched every third frame instead of every frame: body detection is almost as heavy as hand detection, and shoulders move slowly. The time saved goes to the hands.
+- **Android:** every camera frame used to create two new 1.2 MB images (about 70 MB per second), and memory clean-up caused stutters. Now the images are reused.
+
+Measured on a computer with a dictionary of 30 moving signs × 3 recordings: comparison 4.5 → 0.9 ms per frame, recording a new sign 186 → 17 ms. Phones are several times slower, so the gain there is more noticeable. This version hasn't been tested on a real phone yet — if anything got worse, please open an [Issue](../../issues).
 
 ## What's new in beta-0.46
 
@@ -194,14 +207,14 @@ The app is not in the App Store yet, so it is built from source code in Xcode. I
 
 ### 1. Download the project
 
-The latest version is in the **`beta-0.46`** branch.
+The latest version is in the **`beta-0.7`** branch.
 
-**Option A: as a ZIP.** At the top left of this page choose the **beta-0.46** branch, then click the green **Code → Download ZIP** button and unpack the archive.
+**Option A: as a ZIP.** At the top left of this page choose the **beta-0.7** branch, then click the green **Code → Download ZIP** button and unpack the archive.
 
 **Option B: with Git** (in Terminal):
 
 ```bash
-git clone -b beta-0.46 https://github.com/Fen1x678/sign_language_interpretation_on_camera.git
+git clone -b beta-0.7 https://github.com/Fen1x678/sign_language_interpretation_on_camera.git
 ```
 
 ### 2. Open the project in Xcode
@@ -351,7 +364,7 @@ Hold a static gesture for about 0.4 seconds; it fires once.
 
 ## Project structure
 
-Files of the latest iPhone version (branch `beta-0.46`). The Android version is in [SignSpeech/Android](https://github.com/SignSpeech/Android).
+Files of the latest iPhone version (branch `beta-0.7`). The Android version is in [SignSpeech/Android](https://github.com/SignSpeech/Android).
 
 ```
 sign_language_interpretation_on_camera/
@@ -378,7 +391,7 @@ sign_language_interpretation_on_camera/
         └── CameraPreview.swift       — camera image and hand skeleton
 ```
 
-A detailed description of the algorithms (in Russian) is in [`GestureControl/README.md`](../../blob/beta-0.46/GestureControl/README.md).
+A detailed description of the algorithms (in Russian) is in [`GestureControl/README.md`](../../blob/beta-0.7/GestureControl/README.md).
 
 ## Troubleshooting
 
