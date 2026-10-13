@@ -33,7 +33,7 @@ struct CameraBody {
 /// • brightness — яркость сцены по данным камеры (EXIF BrightnessValue, шкала APEX):
 ///   примерно −3 и ниже — темно, 0 — полумрак, 2…5 — комната со светом, 7+ — улица днём.
 ///   NaN — камера не сообщила яркость;
-/// • body — плечи, если их нашли (ищутся на каждом кадре, как и руки).
+/// • body — плечи, если их нашли (ищутся раз в три кадра; между поисками — последние найденные).
 typealias CameraFrame = (hands: [CameraHand], brightness: Double, body: CameraBody?)
 
 /// Блоки структурной схемы: «Камера → Получение видеокадров → Обнаружение руки → Определение ключевых точек».
@@ -68,6 +68,11 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var bodyTrackingEnabled = true
     /// Как повернуть кадр, чтобы человек на нём стоял прямо. nil — пока неизвестно.
     private var bodyOrientation: CGImagePropertyOrientation?
+    /// Плечи ищутся раз в `bodyEvery` кадров: они двигаются медленно, а поиск тела почти так же
+    /// тяжёл, как поиск рук. Между поисками берутся последние найденные плечи (только на videoQueue).
+    private static let bodyEvery = 3
+    private var framesSinceBody = CameraManager.bodyEvery
+    private var lastBody: CameraBody?
 
     override init() {
         // Храним только самый свежий кадр: если обработка не успевает, старые кадры отбрасываются.
@@ -199,11 +204,23 @@ final class CameraManager: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             brightness = value
         }
 
-        // Плечи ищем на каждом кадре — так же, как руки, чтобы они двигались вместе с человеком.
+        // Плечи ищем раз в три кадра (они двигаются медленно), между поисками — последние найденные.
         bodyLock.lock()
         let orientation = bodyTrackingEnabled ? bodyOrientation : nil
         bodyLock.unlock()
-        let body = orientation.flatMap { detectBody(in: sampleBuffer, orientation: $0) }
+        let body: CameraBody?
+        if let orientation {
+            framesSinceBody += 1
+            if framesSinceBody >= Self.bodyEvery {
+                framesSinceBody = 0
+                lastBody = detectBody(in: sampleBuffer, orientation: orientation)
+            }
+            body = lastBody
+        } else {
+            framesSinceBody = Self.bodyEvery
+            lastBody = nil
+            body = nil
+        }
 
         let request = handPoseRequest
 

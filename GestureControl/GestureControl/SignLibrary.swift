@@ -386,8 +386,16 @@ final class SignLibrary: ObservableObject {
         /// Пороги с учётом похожих слов словаря (см. `updateNeighbourLimits`).
         var poseThreshold: Float
         var motionThreshold: Float
+        /// Укороченные записи как поток кадров (чтобы не готовить их заново для каждой пары слов).
+        var probeStreams: [MotionStream]
     }
     private var cache: [UUID: Cache] = [:]
+
+    /// Насколько близко записи слова `other` подходят к слову `id`: `[id][other]`.
+    /// Считается один раз для каждой пары слов; после записи или удаления слова пересчитываются
+    /// только пары с этим словом, а не весь словарь.
+    private var poseMargins: [UUID: [UUID: Float]] = [:]
+    private var motionMargins: [UUID: [UUID: Float]] = [:]
 
     /// Самое похожее слово на последних сравнениях, его расстояние относительно порога
     /// (меньше 1 — достаточно похоже) и почему оно не засчитано (если отбраковано проверкой).
@@ -435,7 +443,10 @@ final class SignLibrary: ObservableObject {
     }
 
     func delete(at offsets: IndexSet) {
-        for i in offsets { cache[signs[i].id] = nil }
+        for i in offsets {
+            cache[signs[i].id] = nil
+            forgetMargins(of: signs[i].id)
+        }
         signs.remove(atOffsets: offsets)
         updateMotionWindow()
         updateNeighbourLimits()
@@ -533,10 +544,13 @@ final class SignLibrary: ObservableObject {
             let limit = c.motionThreshold * scale
             var best = Float.infinity
             var rejected: (cost: Float, reason: MotionRejection)?
+            for template in c.motions { template.liveCache.nextGeneration() }
             for template in c.motions {
                 for stream in streams where stream.handCount == template.handCount {
-                    // Если жест заведомо не подходит, DTW прекращается досрочно.
-                    let result = template.cost(on: stream, abandonAbove: min(best, limit * 2))
+                    // Если жест заведомо не подходит, DTW прекращается досрочно. Расстояния до кадров,
+                    // которые уже были в потоке на прошлых кадрах, берутся из кэша шаблона.
+                    let result = template.cost(on: stream, abandonAbove: min(best, limit * 2),
+                                               cache: template.liveCache)
                     best = min(best, result.cost)
                     if let r = result.rejected, r.cost < (rejected?.cost ?? .infinity) { rejected = r }
                 }
@@ -555,21 +569,32 @@ final class SignLibrary: ObservableObject {
     /// Среднее расстояние до трёх ближайших кадров позы (в обычном или зеркальном виде).
     private static func poseCost(_ live: FrameFeatures, _ mirrored: FrameFeatures,
                                  _ poses: [FrameFeatures]) -> Float {
+        // k ближайших (по возрастанию) без выделения памяти на каждом сравнении.
         let k = SignMatching.poseNeighbours
-        var nearest: [Float] = []
+        var nearest = [Float](repeating: 0, count: k)
+        var count = 0
         for pose in poses {
             let d = min(FrameFeatures.shapeDistance(live, pose), FrameFeatures.shapeDistance(mirrored, pose))
             guard d.isFinite else { continue }
-            if nearest.count < k {
-                nearest.append(d)
-                nearest.sort()
+            var i: Int
+            if count < k {
+                i = count
+                count += 1
             } else if d < nearest[k - 1] {
-                nearest[k - 1] = d
-                nearest.sort()
+                i = k - 1
+            } else {
+                continue
             }
+            while i > 0 && nearest[i - 1] > d {
+                nearest[i] = nearest[i - 1]
+                i -= 1
+            }
+            nearest[i] = d
         }
-        guard !nearest.isEmpty else { return .infinity }
-        return nearest.reduce(0, +) / Float(nearest.count)
+        guard count > 0 else { return .infinity }
+        var sum: Float = 0
+        for i in 0..<count { sum += nearest[i] }
+        return sum / Float(count)
     }
 
     /// Выбирает самый похожий жест, если он достаточно похож и явно лучше второго по сходству.
@@ -627,7 +652,16 @@ final class SignLibrary: ObservableObject {
 
     // MARK: Кэш признаков и пороги
 
+    /// Слово изменилось или удалено: его пары с другими словами нужно посчитать заново.
+    private func forgetMargins(of id: UUID) {
+        poseMargins[id] = nil
+        motionMargins[id] = nil
+        for key in poseMargins.keys { poseMargins[key]?[id] = nil }
+        for key in motionMargins.keys { motionMargins[key]?[id] = nil }
+    }
+
     private func rebuildCache(for sign: CustomSign) {
+        forgetMargins(of: sign.id)
         // Позы: из каждой записи берём поровну кадров, чтобы ни одна запись не «перевешивала».
         let groups = sign.poseGroups
         let perGroup = max(8, maxPoseFrames / max(1, groups.count))
@@ -635,16 +669,18 @@ final class SignLibrary: ObservableObject {
         let motions = sign.motions.compactMap(MotionTemplate.init)
         let ownPose = Self.poseThreshold(poseGroups)
         let ownMotion = Self.motionThreshold(motions)
+        let probes = sign.motions.compactMap {
+            MotionTemplate(SignMatching.evenlySpaced($0, count: Self.probeLength))
+        }
         cache[sign.id] = Cache(poses: poseGroups.flatMap { $0 },
                                ownPoseThreshold: ownPose,
                                motions: motions,
                                ownMotionThreshold: ownMotion,
                                poseMedoids: poseGroups.compactMap { Self.medoid(of: $0) },
-                               motionProbes: sign.motions.compactMap {
-                                   MotionTemplate(SignMatching.evenlySpaced($0, count: Self.probeLength))
-                               },
+                               motionProbes: probes,
                                poseThreshold: ownPose,
-                               motionThreshold: ownMotion)
+                               motionThreshold: ownMotion,
+                               probeStreams: probes.map { MotionStream($0.frames) })
         updateMotionWindow()
     }
 
@@ -657,23 +693,48 @@ final class SignLibrary: ObservableObject {
             guard let c = cache[id] else { continue }
             var poseMargin = Float.infinity
             var motionMargin = Float.infinity
+            var poseRow = poseMargins[id] ?? [:]
+            var motionRow = motionMargins[id] ?? [:]
             for otherId in ids where otherId != id {
                 guard let other = cache[otherId] else { continue }
                 // Насколько записи другого слова похожи на это слово (так же, как при распознавании).
-                if !c.poses.isEmpty {
-                    for query in other.poseMedoids {
-                        poseMargin = min(poseMargin, Self.poseCost(query, query.mirrored(), c.poses))
-                    }
-                }
-                if !c.motionProbes.isEmpty {
-                    for query in other.motionProbes {
-                        let stream = MotionStream(query.frames)
-                        for template in c.motionProbes {
-                            motionMargin = min(motionMargin, template.cost(on: stream).cost)
+                let pose: Float
+                if let known = poseRow[otherId] {
+                    pose = known
+                } else {
+                    var margin = Float.infinity
+                    if !c.poses.isEmpty {
+                        for query in other.poseMedoids {
+                            margin = min(margin, Self.poseCost(query, query.mirrored(), c.poses))
                         }
                     }
+                    poseRow[otherId] = margin
+                    pose = margin
                 }
+                poseMargin = min(poseMargin, pose)
+
+                let motion: Float
+                if let known = motionRow[otherId] {
+                    motion = known
+                } else {
+                    // Сосед дальше этого расстояния порог не меняет (см. `neighbourLimit`) — такие
+                    // сравнения DTW прекращает досрочно, а результат тот же.
+                    let cap = c.ownMotionThreshold / SignMatching.neighbourShare
+                    var margin = Float.infinity
+                    if !c.motionProbes.isEmpty {
+                        for stream in other.probeStreams {
+                            for template in c.motionProbes {
+                                margin = min(margin, template.cost(on: stream, abandonAbove: min(margin, cap)).cost)
+                            }
+                        }
+                    }
+                    motionRow[otherId] = margin
+                    motion = margin
+                }
+                motionMargin = min(motionMargin, motion)
             }
+            poseMargins[id] = poseRow
+            motionMargins[id] = motionRow
             cache[id]?.poseThreshold = Self.neighbourLimit(c.ownPoseThreshold, margin: poseMargin,
                                                            base: SignMatching.basePoseThreshold)
             cache[id]?.motionThreshold = Self.neighbourLimit(c.ownMotionThreshold, margin: motionMargin,
@@ -737,6 +798,8 @@ final class SignLibrary: ObservableObject {
         guard let data = try? Data(contentsOf: fileURL),
               let saved = try? JSONDecoder().decode([CustomSign].self, from: data) else { return }
         signs = saved
+        poseMargins = [:]
+        motionMargins = [:]
         for sign in signs { rebuildCache(for: sign) }
         updateNeighbourLimits()
     }

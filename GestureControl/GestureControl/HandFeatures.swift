@@ -49,6 +49,21 @@ struct FrameFeatures {
     private(set) var chirality: [Int]
     /// Направление движения ведущей руки (2 числа, от −1 до 1). Пусто для позы.
     private(set) var motion: [Float]
+    /// Номер кадра: у каждого кадра свой, у зеркального — тот же с флагом `mirrorBit`.
+    /// По нему запоминаются уже посчитанные расстояния (см. `DistanceCache`).
+    private(set) var key: UInt64
+
+    /// Флаг зеркального кадра в `key`.
+    static let mirrorBit: UInt64 = 1 << 62
+    nonisolated(unsafe) private static var lastKey: UInt64 = 0
+    private static let keyLock = NSLock()
+
+    private static func nextKey() -> UInt64 {
+        keyLock.lock()
+        defer { keyLock.unlock() }
+        lastKey += 1
+        return lastKey
+    }
 
     init(_ frame: SignFrame) {
         var values: [Float] = []
@@ -75,6 +90,7 @@ struct FrameFeatures {
         handCount = frame.hands.count
         chirality = frame.hands.map { $0.chirality ?? 0 }
         motion = Self.motionFeatures(frame)
+        key = Self.nextKey()
     }
 
     /// Зеркальное отражение: жест левой руки ↔ тот же жест правой рукой.
@@ -96,6 +112,7 @@ struct FrameFeatures {
         }
         m.chirality = chirality.reversed().map { -$0 }
         if motion.count == 2 { m.motion = [-motion[0], motion[1]] }
+        m.key = key ^ Self.mirrorBit
         return m
     }
 
@@ -393,21 +410,34 @@ enum SignMatching {
     /// с которого начинается найденный жест. `abandonAbove` — если результат заведомо хуже,
     /// расчёт прекращается досрочно (ускорение).
     static func subsequenceDTW(template t: [FrameFeatures], stream s: [FrameFeatures],
-                               abandonAbove: Float = .infinity) -> (cost: Float, start: Int) {
+                               abandonAbove: Float = .infinity,
+                               cache: DistanceCache? = nil) -> (cost: Float, start: Int) {
         let n = t.count, m = s.count
         guard n > 1, m > 1 else { return (.infinity, 0) }
+        // Расстояния до кадров потока, посчитанные на прошлых кадрах камеры, берутся из кэша:
+        // поток сдвигается на один кадр, поэтому заново считается почти только новый столбец.
+        let columns: [DistanceCache.Column]? = cache.map { c in s.map { c.column(for: $0) } }
+        func dist(_ i: Int, _ j: Int) -> Float {
+            guard let columns else { return FrameFeatures.distance(t[i], s[j]) }
+            let column = columns[j]
+            let known = column.values[i]
+            if !known.isNaN { return known }
+            let value = FrameFeatures.distance(t[i], s[j])
+            column.values[i] = value
+            return value
+        }
         let limit = abandonAbove * Float(n)
         var prev = [Float](repeating: 0, count: m)
         var cur = [Float](repeating: 0, count: m)
         var prevStart = Array(0..<m)   // жест может начаться на любом кадре потока
         var curStart = [Int](repeating: 0, count: m)
-        for j in 0..<m { prev[j] = FrameFeatures.distance(t[0], s[j]) }
+        for j in 0..<m { prev[j] = dist(0, j) }
         for i in 1..<n {
-            cur[0] = prev[0] + FrameFeatures.distance(t[i], s[0])
+            cur[0] = prev[0] + dist(i, 0)
             curStart[0] = prevStart[0]
             var rowMin = cur[0]
             for j in 1..<m {
-                let d = FrameFeatures.distance(t[i], s[j])
+                let d = dist(i, j)
                 let faster = prev[j] + d                      // шаблон идёт дальше, поток стоит
                 let same = prev[j - 1] + d                    // оба идут дальше
                 let slower = cur[j - 1] + slowStepWeight * d  // поток идёт дальше, шаблон стоит
@@ -452,6 +482,56 @@ enum MotionRejection {
     }
 }
 
+/// Расстояния от кадров записанного жеста до кадров потока, уже посчитанные на прошлых кадрах камеры.
+///
+/// Поток последних кадров на каждом кадре камеры сдвигается всего на один кадр, а остальные кадры
+/// остаются теми же. Без кэша расстояния до них считались бы заново на каждом кадре — это самая
+/// тяжёлая часть распознавания жестов с движением. Результат DTW с кэшем и без него одинаковый.
+/// Кадры, которые ушли из потока, забываются через несколько сравнений. Только для главного потока.
+final class DistanceCache {
+    final class Column {
+        var values: [Float]
+        var used: Int
+        init(count: Int, used: Int) {
+            values = [Float](repeating: .nan, count: count)
+            self.used = used
+        }
+    }
+
+    private let length: Int
+    private var columns: [UInt64: Column] = [:]
+    private var generation = 0
+    /// Не меньше кадров потока (до 45) × обычный и зеркальный × два потока.
+    private static let maxColumns = 240
+    private static let keepGenerations = 4
+
+    init(length: Int) {
+        self.length = length
+    }
+
+    var count: Int { columns.count }
+
+    /// Начало нового сравнения (новый кадр камеры): старые столбцы забываются.
+    func nextGeneration() {
+        generation += 1
+        if columns.count > Self.maxColumns {
+            let oldest = generation - Self.keepGenerations
+            columns = columns.filter { $0.value.used >= oldest }
+        }
+    }
+
+    /// Расстояния от кадров шаблона до кадра потока (NaN — ещё не посчитано).
+    func column(for frame: FrameFeatures) -> Column {
+        if let column = columns[frame.key] {
+            column.used = generation
+            return column
+        }
+        let column = Column(count: length, used: generation)
+        columns[frame.key] = column
+        return column
+    }
+}
+
 /// Результат сравнения шаблона с потоком кадров.
 struct MotionCost {
     /// Стоимость DTW (меньше — похоже сильнее); бесконечность — не подходит.
@@ -470,12 +550,15 @@ struct MotionTemplate {
     let shapeActivity: Float
     /// Какой рукой записан: +1 правая, −1 левая, 0 — неизвестно или две руки.
     let chirality: Int
+    /// Расстояния до кадров потока, посчитанные на прошлых кадрах (только для распознавания вживую).
+    let liveCache: DistanceCache
 
     init?(_ frames: [SignFrame]) {
         guard frames.count >= 2 else { return nil }
         let features = frames.map(FrameFeatures.init)
         let activity = SignMatching.activity(of: features)
         self.frames = features
+        liveCache = DistanceCache(length: features.count)
         handCount = features[features.count - 1].handCount
         speedActivity = activity.speed.reduce(0, +) / Float(features.count)
         shapeActivity = activity.shape.reduce(0, +) / Float(features.count)
@@ -487,7 +570,8 @@ struct MotionTemplate {
     ///   (иначе кусок другого жеста, например часть круга, сойдёт за короткий жест);
     /// • в найденном отрезке есть движение (или смена формы — для жестов почти без перемещения руки),
     ///   как в шаблоне: неподвижная рука не должна совпадать с жестом с движением.
-    func cost(on stream: MotionStream, abandonAbove: Float = .infinity) -> MotionCost {
+    func cost(on stream: MotionStream, abandonAbove: Float = .infinity,
+              cache: DistanceCache? = nil) -> MotionCost {
         var result = MotionCost()
         guard stream.handCount == handCount else { return result }
         // Если известно, какой рукой записан и показан жест, «неподходящий» вариант (обычный или зеркальный)
@@ -506,7 +590,8 @@ struct MotionTemplate {
         }
         for (frames, extra) in candidates {
             let (raw, start) = SignMatching.subsequenceDTW(template: self.frames, stream: frames,
-                                                           abandonAbove: min(result.cost, abandonAbove) / extra)
+                                                           abandonAbove: min(result.cost, abandonAbove) / extra,
+                                                           cache: cache)
             let cost = raw * extra
             guard cost.isFinite, cost < result.cost else { continue }
             if let reason = rejection(start: start, streamCount: frames.count, stream: stream) {
